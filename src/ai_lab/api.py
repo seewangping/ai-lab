@@ -8,6 +8,7 @@ import time
 
 from fastapi import FastAPI, Path, Query
 
+from ai_lab.deps import ApiKeyDep, SettingsDep
 from ai_lab.schemas import (
     SESSION_ID_PATTERN,
     ChatRequest,
@@ -35,19 +36,26 @@ def greet(name: str, excited: bool = False) -> dict[str, str]:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(payload: ChatRequest) -> dict[str, object]:
-    """对话端点（Day 2 版本：接住并回显，W3 换成真实 LLM 调用）。
+def chat(
+    payload: ChatRequest,
+    api_key: ApiKeyDep,
+    settings: SettingsDep,
+) -> dict[str, object]:
+    """对话端点（Day 3 版本：已鉴权；W3 把 stub 换成真实 LLM 调用）。
 
-    请求体不是手写解析的：ChatRequest 一声明，FastAPI 就负责
-      - 解析 JSON（Content-Type 不对、JSON 语法错 → 422）
-      - 逐字段校验（缺字段、类型错、min_length/pattern/ge 不满足 → 422，附字段路径）
-      - 把干净的 ChatRequest 实例交给你
+    三个参数各有来源，全部由框架注入：
+      - payload  ← 请求体（经 ChatRequest 校验）
+      - api_key  ← 依赖 verify_api_key 的返回值（鉴权失败根本不会走到函数体）
+      - settings ← 依赖 get_settings_dep（测试里可整体替换成假配置）
+
+    路由函数体内没有任何"配置从哪来""谁在调用"的代码——这正是依赖注入的意义。
     """
     started = time.perf_counter()
 
     reply = (
         f"[stub] 收到 {len(payload.message)} 字，session={payload.session_id}，"
-        f"temperature={payload.temperature}，stream={payload.stream}"
+        f"temperature={payload.temperature}，stream={payload.stream}，"
+        f"max_concurrent={settings.max_concurrent}"
     )
 
     # 故意多返回两个没在 ChatResponse 里声明的键，用来验证 response_model 会过滤掉它们。
@@ -63,6 +71,7 @@ def chat(payload: ChatRequest) -> dict[str, object]:
 
 @app.get("/chat/history/{session_id}")
 def chat_history(
+    api_key: ApiKeyDep,
     session_id: str = Path(
         pattern=SESSION_ID_PATTERN,
         description="会话 ID，格式不对直接 422",
