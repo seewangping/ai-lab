@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 环境变量文件（含密钥，绝不提交）
+.env
+.coverage
+.mypy_cache/
+.pytest_cache/

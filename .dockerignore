@@ -1,0 +1,29 @@
+# 构建上下文排除清单。
+# 不写这个，docker build 会把整个目录（含 .venv 上百 MB）发给守护进程，
+# 镜像体积和构建时间都会翻好几倍。
+.venv/
+.git/
+.gitignore
+
+__pycache__/
+*.py[oc]
+
+# 含密钥，绝不能进镜像
+.env
+.env.bak
+.env.example
+
+# 测试与工具产物（运行阶段用不到）
+tests/
+.coverage
+.mypy_cache/
+.pytest_cache/
+.vscode/
+
+# 一次性实验脚本
+probe_day4.py
+
+# 容器自身的定义文件
+Dockerfile
+compose.yaml
+.dockerignore

@@ -1,0 +1,9 @@
+services:
+  app:
+    build: .
+    image: ai-lab:0.1
+    # .env 里的密钥以环境变量注入容器，而不是打进镜像
+    env_file: .env
+    # 开发期挂载源码：改代码不用重新 build（生产环境不要这么写）
+    volumes:
+      - ./src:/app/src

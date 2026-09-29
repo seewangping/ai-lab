@@ -1,0 +1,46 @@
+[project]
+name = "ai-lab"
+version = "0.1.0"
+description = "一个用于练习 Python 后端工程化的最小项目：配置 / 日志 / 异常 / 异步并发 / 测试 / 容器化"
+readme = "README.md"
+authors = [
+    { name = "王俊平", email = "wpji561@qq.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.15.0",
+]
+
+[project.scripts]
+ai-lab = "ai_lab:main"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.mypy]
+# pydantic 官方 mypy 插件：让它知道字段可以从环境变量注入，
+# 否则 Settings() 会被误报「缺少必填参数 llm_api_key」
+plugins = ["pydantic.mypy"]
+# 多余的 # type: ignore 也当作错误 —— 防止代码演进后留下过期的抑制注释
+warn_unused_ignores = true
+
+[tool.coverage.run]
+# async_demo.py 是可执行的实验脚本，不是库代码，不计入覆盖率
+omit = ["src/ai_lab/async_demo.py"]
+
+[tool.coverage.report]
+# __main__ 守卫里的代码是本地演示入口，不是被调用的库逻辑，不计入覆盖率
+exclude_also = ["if __name__ == .__main__.:"]
