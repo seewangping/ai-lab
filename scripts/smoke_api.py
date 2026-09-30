@@ -12,7 +12,9 @@
 退出码：全部符合预期 → 0，任一不符 → 1（可以接进 CI 或 git hook）。
 """
 
+import json
 import sys
+import time
 
 import httpx
 
@@ -29,6 +31,17 @@ def check(name: str, actual: int, expected: int, extra: str = "") -> None:
     ok = actual == expected
     mark = "PASS" if ok else "FAIL"
     line = f"[{mark}] {name:<44} http={actual} (期望 {expected})"
+    if extra:
+        line += f"  {extra}"
+    print(line)
+    if not ok:
+        failures.append(name)
+
+
+def check_true(name: str, ok: bool, extra: str = "") -> None:
+    """布尔断言：用于"时序/帧数"这类没有状态码可比的东西。"""
+    mark = "PASS" if ok else "FAIL"
+    line = f"[{mark}] {name:<44} {'符合' if ok else '不符合'}"
     if extra:
         line += f"  {extra}"
     print(line)
@@ -82,6 +95,73 @@ def main() -> int:
         # 7. 历史端点（受保护）
         resp = client.get("/chat/history/sess-smoke-001", params={"limit": 5}, headers=auth)
         check("GET /chat/history/{id} 带密钥", resp.status_code, 200, resp.text)
+
+        # 8~11. SSE 流式：内容维度 + 时序维度（时序只能在真实 HTTP 上验）
+        started = time.perf_counter()
+        first_at: float | None = None
+        last_at: float | None = None
+        data_frames = 0
+        events: list[str] = []
+        current_event: str | None = None
+        done_payload: dict[str, object] = {}
+
+        with client.stream("POST", "/chat/stream", json=VALID_BODY, headers=auth) as resp:
+            check(
+                "POST /chat/stream 流式响应",
+                resp.status_code,
+                200,
+                f"content-type={resp.headers.get('content-type')}",
+            )
+            check_true(
+                "响应头 X-Accel-Buffering: no",
+                resp.headers.get("x-accel-buffering") == "no",
+                "（缺了它 Nginx 会把 token 攒起来）",
+            )
+            for line in resp.iter_lines():
+                if line.startswith("event: "):
+                    current_event = line.removeprefix("event: ")
+                    events.append(current_event)
+                elif line.startswith("data:"):
+                    now = time.perf_counter() - started
+                    if first_at is None:
+                        first_at = now
+                    last_at = now
+                    data_frames += 1
+                    if current_event == "done":
+                        done_payload = json.loads(line.removeprefix("data:").strip())
+
+        check_true(
+            "SSE 帧数 > 10（真的分了多帧）",
+            data_frames > 10,
+            f"data 帧 {data_frames} 个",
+        )
+        check_true(
+            "事件序列 meta → token × N → done",
+            events[:1] == ["meta"] and events[-1:] == ["done"] and "token" in events,
+            f"首 {events[:1]} 末 {events[-1:]}",
+        )
+        check_true(
+            "首帧到达 < 0.3s（没有被缓冲）",
+            first_at is not None and first_at < 0.3,
+            f"首帧 {0 if first_at is None else first_at:.3f}s",
+        )
+        check_true(
+            "首末帧间隔 > 0.3s（token 是逐帧摊开的）",
+            first_at is not None and last_at is not None and (last_at - first_at) > 0.3,
+            f"间隔 {(last_at or 0) - (first_at or 0):.3f}s",
+        )
+        if done_payload:
+            print(f"        └─ done 帧   : chunks={done_payload.get('chunks')} "
+                  f"ttft_ms={done_payload.get('ttft_ms')} latency_ms={done_payload.get('latency_ms')}")
+
+        # 12. stream=true 走同一个端点也应返回 SSE
+        with client.stream("POST", "/chat", json={**VALID_BODY, "stream": True}, headers=auth) as resp:
+            check(
+                "POST /chat stream=true 返回 SSE",
+                resp.status_code,
+                200,
+                f"content-type={resp.headers.get('content-type')}",
+            )
 
     print("-" * 78)
     if failures:

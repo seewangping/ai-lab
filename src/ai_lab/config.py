@@ -7,6 +7,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 把 .env 锚定到项目根（config.py 在 src/ai_lab/ 下，parents[2] 即 D:\ai-lab）。
@@ -30,6 +31,12 @@ class Settings(BaseSettings):
     llm_timeout: float = 30.0
     max_concurrent: int = 5
     max_retries: int = 3
+
+    # 流式输出里每个 token 之间的间隔（毫秒）。W3 接真实 LLM 后这个值就没用了
+    # （节奏由上游决定），现在用来模拟"打字机效果"。
+    # 之所以做成配置项：测试里覆盖成 0 就能让流式用例瞬间跑完——这就是
+    # "配置驱动的行为可以被测试"的实际用途，而不是为了好看。
+    stream_delay_ms: float = Field(default=20.0, ge=0.0)
 
 
 @lru_cache
