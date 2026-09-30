@@ -4,6 +4,8 @@
 
 目标不是功能多，而是**每条工程约束都有可运行的证据**：类型检查零报错、测试覆盖率 100%、镜像 197MB、容器以非 root 运行。
 
+第 1 周打地基（配置 / 日志 / 异常 / 异步 / 测试 / 容器化），第 2 周在此基础上长成一个 FastAPI 服务：入参校验、依赖注入、SSE 流式输出。
+
 ## 目录结构
 
 ```
@@ -15,8 +17,15 @@ ai-lab/
 │   ├── logging_setup.py    # 结构化日志：单行 JSON，幂等初始化
 │   ├── errors.py           # 异常体系：可重试 / 不可重试分类 + HTTP 状态码映射
 │   ├── session.py          # 数据类练习（含校验逻辑）
-│   └── async_demo.py       # 并发实验脚本：gather vs 串行、超时、信号量限流
+│   ├── async_demo.py       # 并发实验脚本：gather vs 串行、超时、信号量限流
+│   ├── api.py              # [W2] FastAPI 应用：/health /greet /chat /chat/stream /chat/history
+│   ├── schemas.py          # [W2] Pydantic 请求/响应模型（校验规则写在边界层）
+│   ├── deps.py             # [W2] 依赖注入：Settings 提供者 + X-API-Key 鉴权
+│   ├── streaming.py        # [W2] SSE 帧编码、心跳、异步生成器（手写协议，不引库）
+│   └── stub_llm.py         # [W2] 占位模型层：接真实 LLM 时唯一要替换的模块
 ├── tests/                  # pytest 用例，不依赖本机真实 .env
+├── scripts/                # 手动验证脚本：冒烟测试、时序探针、Python 语法导览
+├── docs/                   # 读书笔记 / 速查表
 ├── Dockerfile              # 多阶段构建，运行阶段不含 uv / pytest / 编译器
 ├── compose.yaml            # 开发用：挂载源码 + 注入 .env
 ├── .env.example            # 配置模板（提交）；.env 是真实值（不提交）
@@ -41,7 +50,17 @@ uv run mypy src/ tests/
 uv run pytest -q --cov=ai_lab --cov-report=term-missing
 ```
 
-当前状态：`mypy` 11 个文件零报错；`pytest` 31 个用例全过，覆盖率 **100%**。
+当前状态：`mypy` 19 个文件零报错；`pytest` 82 个用例全过，覆盖率 **100%**。
+
+## 补充材料（写给 C# 出身的自己）
+
+- `docs/python-syntax-for-csharp-devs.md` —— **读码五步法** + C#↔Python 语法对照表 + 本项目真实代码的逐行解码
+- `scripts/syntax_tour.py` —— 13 节可运行的语法导览，每节都有 C# 对照和打印出来的证据
+
+```bash
+uv run python scripts/syntax_tour.py        # 跑全部
+uv run python scripts/syntax_tour.py 4 8    # 只看推导式和装饰器
+```
 
 ## Docker 运行
 
