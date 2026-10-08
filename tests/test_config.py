@@ -31,7 +31,11 @@ def _clear_settings_cache() -> Iterator[None]:
 
 @pytest.fixture
 def api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    """只提供必填项，让其余字段走默认值。"""
+    """只提供两个必填项，让其余字段走默认值。
+
+    注意两把钥匙给了【不同】的值：相同会被 model_validator 拒绝（见文件末尾的用例）。
+    """
+    monkeypatch.setenv("CLIENT_API_KEY", "dev-client-key")
     monkeypatch.setenv("LLM_API_KEY", "sk-test-key")
 
 
@@ -58,13 +62,35 @@ def test_env_var_overrides_default(api_key: None, monkeypatch: pytest.MonkeyPatc
 
 
 def test_missing_required_field_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """必填项缺失时必须启动即报错（fail fast），而不是等到运行时。"""
+    """必填项缺失时必须启动即报错（fail fast），而不是等到运行时。
+
+    两把钥匙都是必填——缺哪个都要在启动那一刻就说清楚，别留到线上。
+    """
+    monkeypatch.delenv("CLIENT_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
 
     with pytest.raises(ValidationError) as exc_info:
         Settings(_env_file=None)
 
-    assert "llm_api_key" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "client_api_key" in message
+    assert "llm_api_key" in message
+
+
+def test_client_and_llm_keys_must_differ(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两把钥匙填成同一个值 → 拒绝启动。
+
+    这条校验存在的理由：拆钥匙的全部价值在于"失效域不同"。
+    填成一样，对外密钥泄露就同时等于上游密钥泄露，拆分就成了摆设——
+    而配置写错这件事，只有在校验里才会被发现（文档里写一万句也没用）。
+    """
+    monkeypatch.setenv("CLIENT_API_KEY", "same-value")
+    monkeypatch.setenv("LLM_API_KEY", "same-value")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+
+    assert "CLIENT_API_KEY 不能与 LLM_API_KEY 相同" in str(exc_info.value)
 
 
 def test_get_settings_returns_same_instance(api_key: None) -> None:

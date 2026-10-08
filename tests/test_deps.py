@@ -6,10 +6,20 @@
 """
 
 import pytest
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from ai_lab.config import Settings
 from ai_lab.deps import get_settings_dep, verify_api_key
+
+# 两把钥匙给【不同】的值——相同会被 config.py 的 model_validator 拒绝启动
+TEST_CLIENT_KEY = "client-key-for-tests"
+TEST_LLM_KEY = "sk-upstream-key-for-tests"
+
+
+def _settings() -> Settings:
+    """测试用假配置：不读本机 .env，值与机器无关。"""
+    return Settings(_env_file=None, client_api_key=TEST_CLIENT_KEY, llm_api_key=TEST_LLM_KEY)
 
 
 def test_dependency_is_cached_within_one_request() -> None:
@@ -133,28 +143,34 @@ def test_verify_api_key_accepts_matching_key() -> None:
 
     这是"依赖写成函数"的额外好处：既能当 HTTP 依赖用，也能当普通函数测。
     """
-    from ai_lab.config import Settings
-
-    settings = Settings(_env_file=None, llm_api_key="sk-abc")
-
-    assert verify_api_key(settings=settings, x_api_key="sk-abc") == "sk-abc"
+    assert verify_api_key(settings=_settings(), x_api_key=TEST_CLIENT_KEY) == TEST_CLIENT_KEY
 
 
 def test_verify_api_key_rejects_missing_and_wrong() -> None:
-    from ai_lab.config import Settings
-
-    settings = Settings(_env_file=None, llm_api_key="sk-abc")
-
-    for bad in (None, "", "sk-wrong"):
+    for bad in (None, "", "client-key-wrong"):
         with pytest.raises(HTTPException) as exc_info:
-            verify_api_key(settings=settings, x_api_key=bad)
+            verify_api_key(settings=_settings(), x_api_key=bad)
         assert exc_info.value.status_code == 401
+
+
+def test_llm_key_is_not_accepted_as_client_credential() -> None:
+    """上游密钥不能当门禁卡用——这是"拆两把钥匙"的回归测试。
+
+    W2 早期对外校验直接比对 llm_api_key，等于把上游密钥当客户端凭据发出去：
+    任何人拿到你的服务密钥，就能绕过你的服务直接刷你的账单。
+    这条断言把那个错误钉死——将来谁改回单钥匙，这里立刻红。
+    """
+    with pytest.raises(HTTPException) as exc_info:
+        verify_api_key(settings=_settings(), x_api_key=TEST_LLM_KEY)
+
+    assert exc_info.value.status_code == 401
 
 
 def test_header_alias_is_case_insensitive() -> None:
     """HTTP 头大小写不敏感：x-api-key / X-API-Key / X-Api-Key 都能通过。
 
-    这条验证别名配置正确——生产里客户端用什么大小写都不该失败。
+    这条验证头名配置正确——生产里客户端用什么大小写都不该失败。
+    注意只有【头名】不敏感，头的【值】是敏感的（下面坏值用例里 sk-wrong 就是被值卡住的）。
     """
     sub = FastAPI()
 
@@ -162,13 +178,9 @@ def test_header_alias_is_case_insensitive() -> None:
     def secured(key: str = Depends(verify_api_key)) -> dict[str, str]:
         return {"key": key}
 
-    from ai_lab.config import Settings
+    sub.dependency_overrides[get_settings_dep] = _settings
 
-    sub.dependency_overrides[get_settings_dep] = lambda: Settings(
-        _env_file=None, llm_api_key="sk-abc"
-    )
-
-    resp = TestClient(sub).get("/secured", headers={"x-api-key": "sk-abc"})
+    resp = TestClient(sub).get("/secured", headers={"x-api-key": TEST_CLIENT_KEY})
 
     assert resp.status_code == 200
 
@@ -179,10 +191,11 @@ def test_settings_dependency_returns_singleton() -> None:
 
 
 def test_missing_header_returns_401_not_422() -> None:
-    """缺 X-API-Key 头必须是 401，不能因为"参数是必填"退化成 422。
+    """缺 X-API-Key 头必须是 401，不能退化成 422。
 
-    因为 x_api_key 的类型是 str | None 且默认 None——校验交给 verify_api_key 自己做，
-    框架层面它只是"可选头"，所以不会抢先生成 422。
+    这是把 X-API-Key 从 `Header(...)` 换成 `APIKeyHeader(...)` 之后仍要守住的行为：
+    APIKeyHeader 默认 auto_error=True 会自己抛 401「Not authenticated」，
+    我们用 auto_error=False 关掉它，把判断权收回来，好给出能照着改的提示。
     """
     sub = FastAPI()
 
@@ -190,12 +203,10 @@ def test_missing_header_returns_401_not_422() -> None:
     def secured(key: str = Depends(verify_api_key)) -> dict[str, str]:
         return {"key": key}
 
-    from ai_lab.config import Settings
+    sub.dependency_overrides[get_settings_dep] = _settings
 
-    sub.dependency_overrides[get_settings_dep] = lambda: Settings(
-        _env_file=None, llm_api_key="sk-abc"
-    )
-
-    resp = TestClient(sub).get("/secured", headers={"X-API-Key": ""})
+    resp = TestClient(sub).get("/secured")
 
     assert resp.status_code == 401
+    assert resp.json() == {"detail": "缺少或错误的 X-API-Key"}
+    assert resp.headers["WWW-Authenticate"] == "ApiKey"

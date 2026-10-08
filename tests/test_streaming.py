@@ -39,7 +39,8 @@ from ai_lab.streaming import (
 
 client = TestClient(app)
 
-TEST_API_KEY = "sk-test-key-for-tests"
+TEST_API_KEY = "client-key-for-tests"
+TEST_LLM_KEY = "sk-upstream-key-for-tests"
 AUTH = {"X-API-Key": TEST_API_KEY}
 
 VALID_PAYLOAD: dict[str, object] = {
@@ -53,7 +54,8 @@ def _fake_settings() -> Settings:
     测试里把它关掉——"配置驱动的行为可以被测试"的实际用途。"""
     return Settings(
         _env_file=None,
-        llm_api_key=TEST_API_KEY,
+        client_api_key=TEST_API_KEY,
+        llm_api_key=TEST_LLM_KEY,
         llm_base_url="https://fake.example/v1",
         llm_timeout=5.0,
         max_concurrent=2,
@@ -261,7 +263,12 @@ def test_stream_stops_early_when_client_disconnects() -> None:
     这里直接调用生成器并注入一个假 is_disconnected —— 时序场景变成普通断言。
     """
     payload = ChatRequest(message="你好", session_id="sess-x")
-    settings = Settings(_env_file=None, llm_api_key="sk-x", stream_delay_ms=0.0)
+    settings = Settings(
+        _env_file=None,
+        client_api_key=TEST_API_KEY,
+        llm_api_key="sk-x",
+        stream_delay_ms=0.0,
+    )
     calls = {"n": 0}
 
     async def fake_is_disconnected() -> bool:
@@ -291,7 +298,12 @@ def test_stream_stops_early_when_client_disconnects() -> None:
 def test_stream_without_disconnect_callback_sends_everything() -> None:
     """不传回调也能正常工作（回调是可选的）。"""
     payload = ChatRequest(message="你好", session_id="sess-x")
-    settings = Settings(_env_file=None, llm_api_key="sk-x", stream_delay_ms=0.0)
+    settings = Settings(
+        _env_file=None,
+        client_api_key=TEST_API_KEY,
+        llm_api_key="sk-x",
+        stream_delay_ms=0.0,
+    )
 
     async def collect() -> list[tuple[str | None, str]]:
         frames = [f async for f in sse_chat_stream(payload, settings, reply="abc")]

@@ -61,7 +61,8 @@ def measure(lines: Iterable[str], label: str) -> None:
 
 def main() -> int:
     settings = get_settings()
-    auth = {"X-API-Key": settings.llm_api_key}
+    # 对外凭据：调用方发在 X-API-Key 里的值，与服务端调上游 LLM 的密钥是两把不同的钥匙
+    auth = {"X-API-Key": settings.client_api_key}
     print(f"token 间隔配置: {settings.stream_delay_ms} ms")
     print("-" * 70)
 

@@ -20,14 +20,17 @@ from ai_lab.deps import get_settings_dep
 client = TestClient(app)
 
 # 测试用的假配置：所有值都是显式给的，_env_file=None 表示"别去读 .env"
-TEST_API_KEY = "sk-test-key-for-tests"
+# 两把钥匙给不同的值——对外凭据（客户端的门禁卡）与上游凭据（服务端的钥匙）必须分开
+TEST_API_KEY = "client-key-for-tests"
+TEST_LLM_KEY = "sk-upstream-key-for-tests"
 TEST_MAX_CONCURRENT = 2
 
 
 def _fake_settings() -> Settings:
     return Settings(
         _env_file=None,
-        llm_api_key=TEST_API_KEY,
+        client_api_key=TEST_API_KEY,
+        llm_api_key=TEST_LLM_KEY,
         llm_base_url="https://fake.example/v1",
         llm_timeout=5.0,
         max_concurrent=TEST_MAX_CONCURRENT,
@@ -215,6 +218,43 @@ def test_chat_with_wrong_api_key_returns_401() -> None:
     resp = client.post("/chat", json=VALID_PAYLOAD, headers={"X-API-Key": "sk-wrong"})
 
     assert resp.status_code == 401
+
+
+def test_upstream_llm_key_is_not_a_valid_client_credential() -> None:
+    """拿上游 LLM 的密钥当 X-API-Key 用 → 401。
+
+    这条是"两把钥匙"的安全回归测试。曾经的实现直接比对 llm_api_key，
+    那时的行为是：把服务端调 DeepSeek 的密钥，当成发给客户端的门禁卡。
+    后果不是"权限给多了"，而是绕过服务直接刷上游账单。
+    """
+    resp = client.post("/chat", json=VALID_PAYLOAD, headers={"X-API-Key": TEST_LLM_KEY})
+
+    assert resp.status_code == 401
+
+
+def test_openapi_declares_api_key_as_security_scheme() -> None:
+    """OpenAPI 要把 X-API-Key 声明成 security scheme，不能是「选填参数」。
+
+    区别很实际：手写 Header(alias=...) 时它会出现在 parameters 里且
+    required=False、security 为空——Swagger UI 上表现为「不用填、没有锁」，
+    用户照着文档点 Try it out 会撞上 401 却完全不知道为什么（文档与行为不符）。
+    换成 APIKeyHeader 之后生成 security 段，Swagger UI 出现 Authorize 按钮。
+    """
+    spec = app.openapi()
+    operation = spec["paths"]["/chat"]["post"]
+
+    assert operation["security"] == [{"APIKeyHeader": []}]
+
+    scheme = spec["components"]["securitySchemes"]["APIKeyHeader"]
+    assert scheme["type"] == "apiKey"
+    assert scheme["in"] == "header"
+    assert scheme["name"] == "X-API-Key"
+    # 顺带确认说明文案真的进了文档（Swagger UI 的 Authorize 弹窗里会显示）
+    assert "上游" in scheme["description"]
+
+    # 反向断言：它不该再以「必填标志为 False 的普通参数」形式出现
+    header_params = [p for p in operation.get("parameters", []) if p["in"] == "header"]
+    assert header_params == []
 
 
 def test_auth_runs_before_body_validation() -> None:

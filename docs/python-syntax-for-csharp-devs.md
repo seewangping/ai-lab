@@ -288,18 +288,37 @@ lines.extend(f"data: {line}" for line in data.split("\n"))
 
 等价于：`for line in data.split("\n"): lines.append(f"data: {line}")`
 
-### 例 3 · `deps.py:40`
+### 例 3 · `deps.py:57`
 
 ```python
-x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+ApiKeyHeaderDep = Annotated[str | None, Depends(_api_key_scheme)]
 ```
 
-拆成 4 部分：
+拆成 3 部分：
 
-1. `x_api_key` —— 函数这里会收到 `X-API-Key` 头的值
-2. `str | None` —— 可能没有这个头（None）
-3. `Header(alias=...)` —— 告诉 FastAPI：值从**请求头**取，头名叫 `X-API-Key`
-4. `= None` —— 缺省值，配合上面的 `| None` 才走"缺省"分支
+1. `ApiKeyHeaderDep` —— 这只是个**变量名**，等价于 C# 里 `using ApiKeyHeaderDep = ...;` 的类型别名。`xxxDep` 是本项目的约定：凡是 `Annotated[..., Depends(...)]` 都叫 `XxxDep`
+2. `str | None` —— 值的类型：可能拿到字符串，也可能什么都没有（None）。这就是 Python 3.10+ 的联合类型写法，等于 C# 的 `string?`
+3. `Annotated[类型, 元数据]` —— **类型不变，只是挂上一句"这个值从哪来"**。`Depends(_api_key_scheme)` 就是那句元数据：FastAPI 读到它才知道要去请求头里找 `X-API-Key`
+
+关键认知：`Annotated` 本身在运行时几乎不做事，它纯粹是给框架读的"说明书"。
+没有 FastAPI，`ApiKeyHeaderDep` 就只是 `str | None` 的别名。
+
+**同一个位置，换一个元数据就换一个取值来源**——对比着看：
+
+```python
+# 直接声明成普通请求头参数
+x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None
+
+# 声明成"安全方案"（本项目的写法）
+x_api_key: Annotated[str | None, Depends(_api_key_scheme)]
+```
+
+第一行有 `= None`、第二行没有——这个差别不是风格问题：
+`Depends` 本身会提供值，所以不能再给默认值；而第一行的 `= None` 正是让它被
+OpenAPI 记成"选填参数"的原因（详见 README 的「鉴权声明的两种写法」）。
+
+顺带一个读码技巧：**看到 `Annotated` 里带着 `Depends`，就去文件上方找那个 `_xxx_scheme`
+变量的定义**——参数上只有结果，真正"从哪取"写在变量定义处。
 
 ### 例 4 · `streaming.py:142-157`（最像"C# 里没有的东西"的一段）
 

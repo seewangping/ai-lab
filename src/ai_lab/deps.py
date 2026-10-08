@@ -14,7 +14,8 @@
 import secrets
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import APIKeyHeader
 
 from ai_lab.config import Settings, get_settings
 
@@ -35,23 +36,50 @@ def get_settings_dep() -> Settings:
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 
 
+# 用官方的 APIKeyHeader 而不是手写 Header(alias=...)，差别只在【OpenAPI 文档】上：
+#
+#   手写 Header        → parameters 里多一个 X-API-Key，标注 required=False，
+#                        security 段为空 → Swagger UI 里这个头显示成「选填、无锁」，
+#                        用户不填就点 Try it out，撞上 401 却不知道为什么。
+#                        （因为它有个 = None 默认值，框架认为它可选——文档与真实行为不符）
+#   APIKeyHeader 方案  → 不占 parameters，改为生成 security + securitySchemes，
+#                        Swagger UI 顶部出现「Authorize」按钮和锁图标，语义正确。
+#
+# auto_error=False 是关键：默认的 True 会自己抛 401「Not authenticated」，
+# 我们就没法给出"缺少或错误的 X-API-Key"这种能照着改的提示，也拿不到恒定时间比较。
+# 关掉它之后，缺失时这里收到 None，判断权回到我们手上。
+_api_key_scheme = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+    description="调用方凭据。注意它与服务端调用上游 LLM 用的密钥是两把不同的钥匙。",
+)
+
+ApiKeyHeaderDep = Annotated[str | None, Depends(_api_key_scheme)]
+
+
 def verify_api_key(
     settings: SettingsDep,
-    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+    x_api_key: ApiKeyHeaderDep,
 ) -> str:
     """鉴权依赖：校验请求头里的 X-API-Key，对不上就 401。
 
     依赖的返回值会被注入到路由参数里，所以它能"既鉴权又传值"。
 
-    两个细节：
-      1. `Header(alias="X-API-Key")`——HTTP 头是大小写不敏感的，alias 只是显式写清
-         名字（不写 alias 时 FastAPI 会把参数名 x_api_key 自动转成 x-api-key）。
+    三个细节：
+      1. 比对的是 settings.client_api_key（对外凭据），**不是** llm_api_key。
+         后者是服务端调用上游 LLM 的钥匙，拿它对客户端做校验等于把上游
+         密钥当门禁卡发出去——客户端一旦泄露，别人可以绕过你的服务直接刷账单。
       2. 用 secrets.compare_digest 而不是 ==：恒定时间比较，避免通过响应耗时
          逐位猜出密钥（时序攻击）。这是密钥比较的标准做法。
+      3. 头名大小写由 HTTP 规范保证不敏感（x-api-key / X-API-Key 等价），
+         但头的【值】是大小写敏感的。
     """
-    if not x_api_key or not secrets.compare_digest(x_api_key, settings.llm_api_key):
+    if not x_api_key or not secrets.compare_digest(x_api_key, settings.client_api_key):
         # 这里用 HTTPException 是"HTTP 层"的错误；业务层抛的是 W1 的 AppError，
         # 两者在 Day 6 由全局异常处理器统一成同一种 JSON 结构。
+        #
+        # WWW-Authenticate 的值是自定义 scheme token（没有 RFC 注册 ApiKey 这个方案，
+        # 规范只要求它是合法 token，且比对时不区分大小写）。
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="缺少或错误的 X-API-Key",

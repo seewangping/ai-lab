@@ -149,7 +149,7 @@ def main() -> int:
                 "POST",
                 "/chat/stream",
                 json={"message": "短", "session_id": "demo-sse"},
-                headers={"X-API-Key": settings.llm_api_key},
+                headers={"X-API-Key": settings.client_api_key},
             ) as resp:
                 print(f"  状态码 {resp.status_code}，content-type={resp.headers.get('content-type')}")
                 print(f"  x-accel-buffering={resp.headers.get('x-accel-buffering')}  ← 少了它 Nginx 会攒缓冲")

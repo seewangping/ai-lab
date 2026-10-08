@@ -18,7 +18,7 @@ import time
 
 import httpx
 
-from ai_lab.config import get_settings
+from ai_lab.config import get_settings, mask_secret
 
 BASE_URL = "http://127.0.0.1:8000"
 
@@ -53,10 +53,10 @@ def main() -> int:
     settings = get_settings()
     # 只打印掩码，绝不回显真实密钥（脚本可能被录屏 / 贴进 issue）
     print(f"目标服务: {BASE_URL}")
-    print(f"使用密钥: {settings.llm_api_key[:4]}***{settings.llm_api_key[-3:]}")
+    print(f"使用密钥: {mask_secret(settings.client_api_key)}   （对外凭据 client_api_key）")
     print("-" * 78)
 
-    auth = {"X-API-Key": settings.llm_api_key}
+    auth = {"X-API-Key": settings.client_api_key}
 
     with httpx.Client(base_url=BASE_URL, timeout=10.0) as client:
         # 1. 存活探针：免鉴权
