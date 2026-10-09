@@ -17,12 +17,18 @@ from ai_lab.schemas import (
 )
 from ai_lab.stub_llm import MODEL_NAME, build_reply
 from ai_lab.streaming import SSE_HEADERS, SSE_MEDIA_TYPE, sse_chat_stream
+from ai_lab.ws import router as ws_router
 
 app = FastAPI(
     title="ai-lab API",
     description="W2 练习：从最小服务长成支持流式输出的对话服务（W4 目标）。",
     version="0.3.0",
 )
+
+# 路由拆分：WS 那部分单独放在 ws.py，用 include_router 挂进来。
+# 好处是这个文件不会随着功能增加无限膨胀，而且 ws.py 能独立被测试。
+# 对照 C#：等同于把 Controller 拆成多个文件后统一注册进 ApplicationBuilder。
+app.include_router(ws_router)
 
 
 @app.get("/health")

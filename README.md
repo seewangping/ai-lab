@@ -22,6 +22,7 @@ ai-lab/
 │   ├── schemas.py          # [W2] Pydantic 请求/响应模型（校验规则写在边界层）
 │   ├── deps.py             # [W2] 依赖注入：Settings 提供者 + X-API-Key 鉴权（APIKeyHeader）
 │   ├── streaming.py        # [W2] SSE 帧编码、心跳、异步生成器（手写协议，不引库）
+│   ├── ws.py               # [W2] WebSocket 端点 + 连接管理器（与 SSE 的取舍见下）
 │   └── stub_llm.py         # [W2] 占位模型层：接真实 LLM 时唯一要替换的模块
 ├── tests/                  # pytest 用例，不依赖本机真实 .env
 ├── scripts/                # 手动验证脚本：冒烟测试、时序探针、Python 语法导览
@@ -60,15 +61,81 @@ uv run mypy src/ tests/
 uv run pytest -q --cov=ai_lab --cov-report=term-missing
 ```
 
-当前状态：`mypy` 19 个文件零报错；`pytest` 86 个用例全过，覆盖率 **100%**。
+当前状态：`mypy` 21 个文件零报错；`pytest` 105 个用例全过，覆盖率 **100%**。
 
-端到端另有两层手动验证（需要服务在跑）：
+端到端另有两层手动验证（需要服务在跑，`uvicorn ai_lab.api:app --port 8000` 另开一个窗口）：
 
 ```bash
-uv run uvicorn ai_lab.api:app --port 8000     # 另开一个窗口
-uv run python scripts/smoke_api.py            # 14 项冒烟：鉴权/校验/流式/响应头全查
+uv run python scripts/smoke_api.py            # HTTP：14 项冒烟（鉴权/校验/流式/响应头）
+uv run python scripts/ws_client_demo.py       # WS：12 项真实客户端验证（握手拒绝/广播/双向）
 uv run python scripts/probe_stream_timing.py  # 时序对照：TestClient 全是 0.000s，真实 HTTP 才有间隔
 ```
+
+> **为什么这两层缺一不可**：TestClient 不经过真实网络栈——协议升级、帧编解码、
+> 缓冲全被跳过。「被拒绝的握手，客户端到底看到什么」这类问题它答不了。
+> 实测：TestClient 里握手被拒是 `WebSocketDisconnect`，真实客户端拿到的是
+> **HTTP 403**（`InvalidStatus`）——同一个行为，两种表现。Day 4 的 SSE 时序也有同样的坑。
+
+## 端点
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| GET | `/health` | 免 | 存活探针 |
+| GET | `/greet/{name}` | 免 | 最小示例（路径参数 + 查询参数） |
+| POST | `/chat` | ✅ | 对话；`stream=true` 时返回 SSE |
+| POST | `/chat/stream` | ✅ | 专用 SSE 流式端点 |
+| GET | `/chat/history/{session_id}` | ✅ | 路径/查询参数约束示例 |
+| **WS** | `/ws/chat` | ✅ | WebSocket：多轮对话、`stream=true` 逐 token、服务端广播 |
+
+⚠️ **`/ws/chat` 不会出现在 `/docs` 里**——OpenAPI 规范只描述 HTTP 请求/响应，
+WebSocket 不属于它。所以 WS 端点必须**手工写文档**（就是下面这段），
+这不是配置没调好，是规范本身的边界。
+
+## SSE vs WebSocket：为什么聊天回复选 SSE
+
+这是 Day 5 的验收题，答案是三条**具体的工程理由**，没有一条是"哪个新"：
+
+| | SSE（`/chat/stream`） | WebSocket（`/ws/chat`） |
+|---|---|---|
+| 方向 | 服务端 → 客户端（单向） | 双向 |
+| 底层 | **就是一个 HTTP 响应** | 先协议升级（101），之后不再有 HTTP 语义 |
+| 断线重连 | 浏览器 `EventSource` 内置，自动带 `Last-Event-ID` 续传 | 自己写重连 + 自己定义"从哪继续" |
+| 认证 | 直接复用现成机制（cookie / 中间件 / 请求头） | 升级后要单独处理（见下） |
+| 中间设施 | 状态码、CORS、HTTP/2 多路复用、Nginx 规则**全部照旧** | 网关要单独为它开口子（超时、缓冲、代理配置都得另配） |
+| 心跳/序号 | 协议里没有，得自己约定（本项目用 `event: done` + 注释帧心跳） | 协议层有 ping/pong，但业务序号仍得自己加 |
+| 自动文档 | 出现在 `/docs` 里 | **不出现在 `/docs` 里**，要手写 |
+| 成本 | 每次对话一个新请求 | 建连一次、多轮复用 |
+| 服务端主动推给**多个**客户端 | 别扭 | 自然（本项目 `joined`/`left` 广播就是它） |
+
+**三条理由**：
+
+1. **聊天是单向流**。客户端发一条、服务端流式回一段——SSE 天生就是这个形状。
+   WS 的双向能力在这个场景里是闲置的，为用不上的能力付复杂度不划算。
+2. **SSE 白送一整套 HTTP 设施**。因为它的响应就是一个普通 HTTP 响应，
+   认证中间件、CORS、限流、网关转发规则全都不用改；WS 升级之后这些全部失效，
+   要一个个单独配。
+3. **重连是别人的问题**。SSE 的断线重连由浏览器实现并自动续传；
+   WS 的重连、去重、断点续传全得自己写。
+
+**WS 该上的场景**：客户端要持续往服务端推数据（协同编辑、游戏操作流），
+或服务端要主动推给多个客户端（在线状态、通知）——后者在 `ws.py` 里有完整演示。
+
+### 一个两边都会撞上的坑：浏览器的凭据怎么带
+
+`EventSource` 和 `WebSocket` **都无法设置自定义请求头**——
+`new WebSocket(url, protocols)` 和 `new EventSource(url)` 都没有 headers 参数。
+
+所以 `X-API-Key` 这种自定义头在浏览器里用不了，只剩两条路：
+
+| 方案 | 优点 | 代价 |
+|---|---|---|
+| 凭据放进 URL（`?api_key=`，本项目 WS 采用） | 客户端最简单 | **会进服务器访问日志**，必须做日志脱敏；URL 可能被分享/留存 |
+| 连上后先发一条鉴权消息 | 不进日志 | 要自己定协议，还要处理"鉴权完成前不许干别的"的中间态 |
+| 换成 Cookie（SSE 可用） | 浏览器自动携带 | 需要 CSRF 防护；跨域下更麻烦 |
+
+非浏览器客户端（Python `websockets`、移动端、服务间互调）不受这个限制，
+`X-API-Key` 正常可用——所以 `ws.py` 里两个来源都支持，请求头优先。
+这条限制是本项目把凭据拆成 `CLIENT_API_KEY`（可轮换）而不是直接用上游密钥的又一个理由。
 
 ## 补充材料（写给 C# 出身的自己）
 
@@ -127,6 +194,10 @@ docker compose run --rm app
 - **两把钥匙分离**：对外凭据 `CLIENT_API_KEY` 与上游凭据 `LLM_API_KEY` 分开，且加校验禁止相同。早期实现用上游密钥直接做门禁卡，等于让客户端凭据一泄露就绕过服务刷上游账单
 - **鉴权声明的两种写法**：手写 `Header(alias=...)` 会让 `X-API-Key` 以 `required=False` 的普通参数出现在 OpenAPI 里（Swagger UI 显示为选填、无锁，与实际 401 行为不符）；换成 `APIKeyHeader` 后生成 `security` 段，Swagger UI 出现 Authorize 按钮和锁图标。两者行为完全相同，**差别只在文档正确性上**——而文档错了比没有文档更坑
 - **恒定时间比较**：密钥比对用 `secrets.compare_digest` 而非 `==`，避免通过响应耗时逐位猜出密钥
+- **WS 的拒绝时机**：必须在 `accept()` **之前** `close()`，这样整个握手被拒（客户端看到 HTTP 403）；若先 accept 再 close，客户端会先认为"连上了"再收到关闭——"连上"和"被踢"变成两件事，客户端很容易写成 bug。实测两种写法在 TestClient 里的表现也不一样
+- **可变全局状态包成依赖**：`ConnectionManager` 是模块级单例（WS 连接是**有状态**的，服务端必须记住谁在线），但它被包成 `get_manager()` 依赖——于是每个测试用例能换上全新实例，不会互相污染。这是 Day 3 那套依赖注入的第二次收益
+- **WS 的错误协议要自己发明**：WS 里没有 422（状态码是 HTTP 概念）。本项目刻意让错误帧与 REST 的 422 响应体**同构**（同样是 `loc`/`type`/`msg`），客户端才能用一套解析逻辑处理两种协议；并且一次坏输入不会断开连接，可以继续对话
+- **WS 的流式不需要发明协议**：直接一条条 `send_json` 即可，没有 `data:` 前缀、没有空行分隔符、没有多行前缀坑。代价是重连、序号、心跳全得自己写——这是 SSE 与 WS 权衡里最直观的一条
 
 ## 已知限制
 
@@ -137,3 +208,6 @@ docker compose run --rm app
 5. **容器内用 `PYTHONPATH=/app/src` 而非 editable 安装**：editable 安装会在源码变化时改写 `.venv` 内的 `.pth` / `dist-info`，导致 20MB 的依赖层被连带失效、重构建变慢。代价是镜像里没有 `ai-lab` 控制台脚本，只能用 `python -m ai_lab`。
 6. **Windows + WSL2 下构建有约 23 秒固定开销**（零改动全缓存构建的耗时）。开发期请用 `docker compose` 挂载源码，不要靠反复 `docker build` 迭代。
 7. **默认 PyPI 源指向清华镜像**（`[[tool.uv.index]]`，为国内网络环境配置）。海外网络下可删除该项以走官方源。
+8. **WS 连接管理器是单进程内存态**：`ConnectionManager` 的集合只存在于当前进程。多 worker（`uvicorn --workers N`）或 K8s 多副本下，广播只能送达**本进程**的连接——跨进程广播需要 Redis pub/sub 之类的消息中间件。和已知限制 2（信号量限流）是同一类问题：**进程内状态在多实例部署下失效**。
+9. **WS 没有重连、续传和业务序号协议**：客户端断开后要自己重连、自己去重、自己决定"从哪继续"。服务端发的 `index` 只是本连接的帧序号，不是可续传的消息 ID。要做断点续传得自己设计消息 ID + 服务端缓存。
+10. **凭据放查询参数会进访问日志**：浏览器场景的无奈之举（`new WebSocket()` 设不了请求头）。生产环境需要在反向代理与日志采集层面做 URL 脱敏，或改用"连上后先发鉴权消息"的方案。
