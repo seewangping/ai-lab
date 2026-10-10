@@ -96,6 +96,14 @@ async def tokenize(text: str, *, delay_s: float = 0.0, chunk_size: int = 1) -> A
 
     真实的 token 是分词器的输出（一个 token ≈ 1~2 个汉字或半个英文词），
     这里按字符切只是为了肉眼观察方便。
+
+    ⚠️ 它产出的是**假流式**：入参 `text` 是一整段已经生成完毕的字符串，
+    这里的 sleep 只是把成品慢慢放出来，**不可能让上游提前产出任何东西**。
+    真流式要求上游是 `AsyncIterator[str]`，产出节奏由模型层掌握。
+    两者在首字延迟上的差距是数量级的，见 scripts/probe_real_vs_fake_streaming.py。
+
+    另注：`asyncio.sleep` 在 Windows 上会向上取整到 15.6ms 的整数倍，
+    所以 STREAM_DELAY_MS=20 实测节奏约 31ms/token（Linux 上无此问题）。
     """
     for i in range(0, len(text), chunk_size):
         if delay_s > 0:

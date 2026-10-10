@@ -172,6 +172,18 @@ async def _send_streamed_reply(
 
     但反过来，客户端的断线重连、事件序号、心跳也全都没人管了——SSE 那套
     是我们觉得麻烦，WS 那套是我们得亲手写。
+
+    ⚠️ 它不是真流式——传输层是真的，生成层是假的。
+
+    第一行 `reply = build_reply(...)` 的返回类型是 `str`：在发出第一个 token
+    之前，整段回复已经生成完毕。逐条 send_json 是真的，"边生成边发"是假的。
+    实测（scripts/probe_real_vs_fake_streaming.py，同一份模型成本）：
+      现状首字延迟 2.11s  ←→  异步生成器形状 0.30s
+    今天看不出来，只因占位模型是瞬间返回的；换成真实模型立刻暴露。
+
+    W3 的改造点就在这里：模型层提供 `AsyncIterator[str]`，本函数改成
+    `async for token in stream_reply(...)`——届时不需要 tokenize 来造节奏，
+    节奏由模型层自己决定。
     """
     reply = build_reply(payload, settings)
     delay_s = settings.stream_delay_ms / 1000.0
