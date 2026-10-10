@@ -76,6 +76,62 @@ uv run python scripts/probe_stream_timing.py  # 时序对照：TestClient 全是
 > 实测：TestClient 里握手被拒是 `WebSocketDisconnect`，真实客户端拿到的是
 > **HTTP 403**（`InvalidStatus`）——同一个行为，两种表现。Day 4 的 SSE 时序也有同样的坑。
 
+### 在 Git Bash 终端里怎么跑、怎么看结果
+
+**先记住一个坑：不要用裸 `python`。** 这台机器上 `python` 解析到的是 WorkBuddy 的
+受管解释器（`~/.workbuddy/binaries/python/...`），**不是本项目 venv**，实测直接报
+`No module named pytest`、退出码 1。两种正确写法：
+
+```bash
+cd /d/ai-lab
+uv run pytest -q                              # 方式一：uv 自动找到 .venv（推荐，最短）
+./.venv/Scripts/python.exe -m pytest -q       # 方式二：显式指定（不依赖 uv）
+
+# 覆盖率（12 个源文件全 100%）
+uv run pytest -q --cov=ai_lab --cov-report=term-missing
+uv run pytest -q --cov=ai_lab --cov-report=html   # 另外生成 htmlcov/index.html
+
+# 类型检查
+uv run mypy src/ tests/                       # 项目标准门
+MYPYPATH=src uv run mypy scripts/             # 脚本目录单跑需要 MYPYPATH
+```
+
+**日常筛选**（都实测过）：
+
+```bash
+uv run pytest tests/test_ws.py -q             # 只跑一个文件 → 19 passed
+uv run pytest tests/test_ws.py -v             # 逐条列出用例名与进度
+uv run pytest -x -q                           # 遇到第一个失败就停
+uv run pytest --lf -q                         # 只重跑上次失败的用例
+uv run pytest tests/test_ws.py -q -k "key or credential"   # 按用例名过滤 → 5 passed
+```
+
+> `-k` 匹配的是**用例名**，不是文件内容。写了个匹配不上的词（如 `-k "auth"`，
+> 而 `test_ws.py` 里没有用例名含 `auth`）会得到 `19 deselected`，**退出码 5**——
+> 看起来像"测了但没输出"，其实是一条都没跑。
+
+**退出码语义**（要写进脚本时用得上，实测确认）：
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 全部通过 |
+| `1` | 有用例失败（含收集期报错） |
+| `5` | 一条都没被收集/选中 |
+| `2` | 被中断（Ctrl+C） |
+
+**⚠️ 取退出码时中间不能插任何命令**，否则拿到的是别的命令的退出码：
+
+```bash
+uv run pytest -q > /tmp/t.log 2>&1    # 正确：重定向到文件，不用管道
+echo "退出码=$?"
+tail -3 /tmp/t.log                    # 再看输出
+
+uv run pytest -q | tail -3            # ❌ 退出码来自 tail，永远是 0
+```
+
+> 这类"假报成功"在本项目已经踩过两次：一次是 `git push | tail` 把 502 报成成功，
+> 一次是 `PIPESTATUS` 中间插了 `echo` 被冲掉。
+
 ## 端点
 
 | 方法 | 路径 | 鉴权 | 说明 |
