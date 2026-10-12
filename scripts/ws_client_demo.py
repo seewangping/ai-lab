@@ -10,7 +10,10 @@
 跑法（需要服务在跑）：
 
     uvicorn ai_lab.api:app --port 8000        # 另开一个窗口
-    PYTHONPATH=src python scripts/ws_client_demo.py
+    uv run python scripts/ws_client_demo.py
+
+（不需要设 PYTHONPATH：ai_lab 是 editable 安装，已能直接 import。
+  CI 里就是这么跑的，见 .github/workflows/ci.yml 的 e2e job。）
 """
 
 import asyncio

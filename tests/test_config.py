@@ -4,8 +4,6 @@
 这里用 monkeypatch 控制环境变量，并用 _env_file=None 关掉文件读取。
 """
 
-from collections.abc import Iterator
-
 import pytest
 from pydantic import ValidationError
 
@@ -21,12 +19,9 @@ from ai_lab.errors import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _clear_settings_cache() -> Iterator[None]:
-    """每个用例前后清空 lru_cache，避免用例之间互相污染。"""
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
+# 原先这里有个 autouse 的 _clear_settings_cache，已移到 tests/conftest.py：
+# test_deps.py 同样需要一个干净的 Settings 缓存，而"每个用例都清缓存"是全局规矩，
+# 不该由某一个测试文件私自提供。留在本文件里只保护本文件，正是它漏掉 test_deps.py 的原因。
 
 
 @pytest.fixture

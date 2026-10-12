@@ -185,8 +185,19 @@ def test_header_alias_is_case_insensitive() -> None:
     assert resp.status_code == 200
 
 
-def test_settings_dependency_returns_singleton() -> None:
-    """get_settings_dep 包的是 lru_cache 单例：多次调用拿到同一个对象。"""
+def test_settings_dependency_returns_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_settings_dep 包的是 lru_cache 单例：多次调用拿到同一个对象。
+
+    注意这里**必须自己给足必填的环境变量**：它是唯一会真正走到
+    `get_settings()` 的依赖测试，而 get_settings 不读参数、只读环境与 .env。
+    不给的话它就会去读开发者本机的 .env ——在本机绿、在 CI 红。
+
+    这个坑是配 GitHub Actions 时发现的：本地跑 105 passed，
+    把 .env 藏起来再跑就变成 1 failed。测试依赖本机环境，等于没测。
+    """
+    monkeypatch.setenv("CLIENT_API_KEY", TEST_CLIENT_KEY)
+    monkeypatch.setenv("LLM_API_KEY", TEST_LLM_KEY)
+
     assert get_settings_dep() is get_settings_dep()
 
 

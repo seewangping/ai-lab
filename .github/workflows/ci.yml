@@ -1,0 +1,128 @@
+name: CI
+
+# 触发时机：推 main、提 PR、以及手动点一次。
+# 为什么要在"推 main"上也跑：本地跑绿只证明"在我的机器上绿"。
+# 真实的第一次失败是这样来的——本地 105 passed，把 .env 藏起来再跑就 1 failed。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一个分支连续推送时，取消上一次还在跑的构建：不浪费时间，也避免两条流水线
+# 同时抢同一份覆盖率结果。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：这个工作流只需要读代码。
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- 质量门
+  quality-gate:
+    name: 质量门 · Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      # 一个版本挂了也让另一个版本跑完——否则看不出是"所有版本都挂"还是"只有某个版本挂"
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          # 锁到与开发机相同的版本：uv 的解析行为会随版本变化，
+          # CI 和本地用不同版本，"本地能装、CI 装不上"这类问题就无从排查
+          version: "0.12.10"
+          enable-cache: true
+
+      - name: 按 uv.lock 安装依赖
+        # --locked = 锁文件与 pyproject 不一致就直接失败，不许偷偷改锁文件。
+        #           （默认行为是自动更新锁文件，那 CI 就失去"复现"的意义了）
+        # --default-index 覆盖 pyproject 里的清华镜像：跑在 GitHub 的机器上，
+        #           走官方源比跨国访问清华更快也更稳。
+        run: uv sync --locked --default-index https://pypi.org/simple
+
+      - name: 类型检查（src/ 与 tests/）
+        run: uv run mypy src/ tests/
+
+      - name: 类型检查（scripts/）
+        # scripts 单跑需要 MYPYPATH 才能解析 src 布局；src/tests 由 mypy 配置覆盖
+        run: uv run mypy scripts/
+        env:
+          MYPYPATH: src
+
+      - name: 测试 + 覆盖率
+        # --cov-fail-under=100：README 写着"覆盖率 100%"，那就让 CI 来守这条线。
+        # 少了这个参数，覆盖率是"某次跑过的观测值"；有了它，才是"不可回退的约束"。
+        run: uv run pytest -q --cov=ai_lab --cov-report=term-missing --cov-fail-under=100
+
+  # ------------------------------------------------- 端到端（真实协议栈）
+  # 这个 job 存在的唯一理由，是 pytest 那一层证不了协议行为：
+  #   TestClient 把 ASGI 事件直接喂给应用，跳过了端口绑定、真实请求头、
+  #   协议升级握手、帧编解码。实测差异：握手被拒时 TestClient 抛
+  #   WebSocketDisconnect，真实客户端拿到的是 HTTP 403；SSE 的时序在
+  #   TestClient 里全是 0.000s。这些结论必须由真实客户端来守。
+  e2e:
+    name: 端到端 · 真实 HTTP / WebSocket
+    runs-on: ubuntu-latest
+
+    env:
+      # 故意用【明确的假值】，而不是配一个 secret。
+      # 测试和脚本本来就该自己造配置；一旦它们偷偷依赖真实密钥，
+      # 我们就会在"CI 恰好配了 secret"的情况下侥幸变绿。
+      CLIENT_API_KEY: ci-client-key
+      LLM_API_KEY: sk-ci-upstream-key
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.10"
+          enable-cache: true
+
+      - name: 按 uv.lock 安装依赖
+        run: uv sync --locked --default-index https://pypi.org/simple
+
+      - name: 起服务 → 打真实 HTTP/WS → 收尾
+        # 启服务和跑脚本放在同一个 step 里：GitHub Actions 的每个 step 是独立 shell，
+        # 上一步用 & 起的后台进程不保证活到下一步。
+        run: |
+          uv run uvicorn ai_lab.api:app --host 127.0.0.1 --port 8000 > /tmp/uvicorn.log 2>&1 &
+          SERVER_PID=$!
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8000/health; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::服务未在 30 秒内就绪"
+            cat /tmp/uvicorn.log
+            exit 1
+          fi
+          echo "服务已就绪 (pid=$SERVER_PID)"
+
+          # 两个脚本各自返回退出码，这里都跑完再汇总——
+          # 前一个失败就中断，会让人以为后一个也是同样的原因。
+          smoke=0
+          ws=0
+          uv run python scripts/smoke_api.py || smoke=$?
+          uv run python scripts/ws_client_demo.py || ws=$?
+
+          kill "$SERVER_PID" 2>/dev/null || true
+
+          if [ "$smoke" != "0" ] || [ "$ws" != "0" ]; then
+            echo "::error::端到端失败：smoke=$smoke ws=$ws"
+            echo "--- 服务端日志（末尾 40 行）---"
+            tail -40 /tmp/uvicorn.log
+            exit 1
+          fi
+          echo "端到端全部通过"
