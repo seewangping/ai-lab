@@ -2,14 +2,14 @@ name: CI
 
 # 触发时机：推 main、提 PR、以及手动点一次。
 # 为什么要在"推 main"上也跑：本地跑绿只证明"在我的机器上绿"。
-# 真实的第一次失败是这样来的——本地 105 passed，把 .env 藏起来再跑就 1 failed。
+# 真实的第一次失败就是这样来的——本地 105 passed，把 .env 藏起来再跑就 1 failed。
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
-# 同一个分支连续推送时，取消上一次还在跑的构建：不浪费时间，也避免两条流水线
+# 同一分支连续推送时，取消上一次还在跑的构建：不浪费时间，也避免两条流水线
 # 同时抢同一份覆盖率结果。
 concurrency:
   group: ci-${{ github.ref }}
@@ -31,22 +31,32 @@ jobs:
         python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: 安装 uv
-        uses: astral-sh/setup-uv@v5
+      - name: 安装 uv（并准备对应版本的 Python）
+        uses: astral-sh/setup-uv@v10
         with:
           # 锁到与开发机相同的版本：uv 的解析行为会随版本变化，
-          # CI 和本地用不同版本，"本地能装、CI 装不上"这类问题就无从排查
+          # CI 与本地用不同版本，"本地能装、CI 装不上"这类问题就无从排查
           version: "0.12.10"
+          # ⚠️ 必须显式传 python-version，matrix 才会真正生效。
+          # 第一次跑的时候漏了这行：两个 job 都去下载 cpython-3.13.15，
+          # 矩阵成了摆设——"看起来测了两个版本"，实际只测了一个。
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
 
       - name: 按 uv.lock 安装依赖
         # --locked = 锁文件与 pyproject 不一致就直接失败，不许偷偷改锁文件。
         #           （默认行为是自动更新锁文件，那 CI 就失去"复现"的意义了）
-        # --default-index 覆盖 pyproject 里的清华镜像：跑在 GitHub 的机器上，
-        #           走官方源比跨国访问清华更快也更稳。
-        run: uv sync --locked --default-index https://pypi.org/simple
+        #
+        # 这里【不能】用 --default-index 覆盖 pyproject 里的清华镜像。原因是
+        # uv.lock 把每个包的 source 与真实下载 URL 都钉死在镜像地址上（680 行），
+        # 换默认源会让 uv 判定"锁文件需要更新"，--locked 直接失败。本地实测：
+        #   uv sync --locked                                        → 退出码 0
+        #   uv sync --locked --default-index https://pypi.org/simple → 退出码 1
+        #     error: The lockfile at `uv.lock` needs to be updated
+        # 所以这两个参数是互斥的：要么换源并重新 uv lock，要么沿用锁里的源。
+        run: uv sync --locked
 
       - name: 类型检查（src/ 与 tests/）
         run: uv run mypy src/ tests/
@@ -80,16 +90,17 @@ jobs:
       LLM_API_KEY: sk-ci-upstream-key
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装 uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10
         with:
           version: "0.12.10"
+          python-version: "3.13"
           enable-cache: true
 
       - name: 按 uv.lock 安装依赖
-        run: uv sync --locked --default-index https://pypi.org/simple
+        run: uv sync --locked
 
       - name: 起服务 → 打真实 HTTP/WS → 收尾
         # 启服务和跑脚本放在同一个 step 里：GitHub Actions 的每个 step 是独立 shell，
