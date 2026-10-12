@@ -111,11 +111,24 @@ jobs:
       - name: 按 uv.lock 安装依赖
         run: uv sync --locked
 
-      - name: 起服务 → 打真实 HTTP/WS → 收尾
+      - name: 起服务 → 打真实 HTTP/WS → 校验错误契约与日志格式 → 收尾
         # 启服务和跑脚本放在同一个 step 里：GitHub Actions 的每个 step 是独立 shell，
         # 上一步用 & 起的后台进程不保证活到下一步。
         run: |
-          uv run uvicorn ai_lab.api:app --host 127.0.0.1 --port 8000 > /tmp/uvicorn.log 2>&1 &
+          # ---------------------------------------------------------------- 起服务
+          # 两条流【分开】重定向，这是 check_json_logs.py 能工作的前提：
+          #   stdout → 我们的 JsonFormatter 输出（JSON）
+          #   stderr → uvicorn 自己的 default handler（纯文本 + traceback）
+          # 合并成一个文件的话，uvicorn 的 traceback 会让"每行必须是 JSON"直接不成立，
+          # 于是校验脚本被迫放宽标准——那它就不再能守住我们真正关心的东西了。
+          #
+          # --no-access-log 关掉 uvicorn 内置的访问日志。它自己也写 stdout 且是纯文本，
+          # 实测不关的话 stdout 里一半的行是不可解析的：
+          #     INFO:     127.0.0.1:60859 - "GET /health HTTP/1.1" 200 OK
+          # 而我们的访问日志信息量严格更大（带 request_id 与 duration_ms），
+          # 留着它等于同一件事付两次钱，还逼着采集端容忍两种格式。
+          uv run uvicorn ai_lab.api:app --host 127.0.0.1 --port 8000 \
+            --no-access-log > /tmp/app.jsonl 2> /tmp/uvicorn.err &
           SERVER_PID=$!
 
           ready=0
@@ -125,24 +138,38 @@ jobs:
           done
           if [ "$ready" != "1" ]; then
             echo "::error::服务未在 30 秒内就绪"
-            cat /tmp/uvicorn.log
+            echo "--- 我们的日志 (stdout) ---"; cat /tmp/app.jsonl || true
+            echo "--- uvicorn 日志 (stderr) ---"; cat /tmp/uvicorn.err || true
             exit 1
           fi
           echo "服务已就绪 (pid=$SERVER_PID)"
 
-          # 两个脚本各自返回退出码，这里都跑完再汇总——
+          # -------------------------------------------------- 三个脚本都必须跑完
+          # 各自返回退出码，这里都跑完再汇总——
           # 前一个失败就中断，会让人以为后一个也是同样的原因。
           smoke=0
           ws=0
+          contract=0
           uv run python scripts/smoke_api.py || smoke=$?
           uv run python scripts/ws_client_demo.py || ws=$?
+          uv run python scripts/probe_error_contract.py || contract=$?
 
           kill "$SERVER_PID" 2>/dev/null || true
 
-          if [ "$smoke" != "0" ] || [ "$ws" != "0" ]; then
-            echo "::error::端到端失败：smoke=$smoke ws=$ws"
-            echo "--- 服务端日志（末尾 40 行）---"
-            tail -40 /tmp/uvicorn.log
+          # ------------------------------------------------- 日志格式（独立一项）
+          # 这一项守的是"测试永远测不到"的东西：应用有没有真的把 JsonFormatter 装上。
+          # 它曾经是没装的（setup_logging 只在 __main__ 和测试里被调用），
+          # 后果是中间件的 INFO 访问日志被 logging.lastResort 整条丢掉——
+          # 而所有 pytest 用例当时全绿。只有读真实服务写出的文件才能发现。
+          logs=0
+          uv run python scripts/check_json_logs.py /tmp/app.jsonl || logs=$?
+
+          if [ "$smoke" != "0" ] || [ "$ws" != "0" ] || [ "$contract" != "0" ] || [ "$logs" != "0" ]; then
+            echo "::error::端到端失败：smoke=$smoke ws=$ws contract=$contract logs=$logs"
+            echo "--- 我们的日志 (stdout，末尾 40 行) ---"
+            tail -40 /tmp/app.jsonl || true
+            echo "--- uvicorn 日志 (stderr，末尾 40 行) ---"
+            tail -40 /tmp/uvicorn.err || true
             exit 1
           fi
           echo "端到端全部通过"

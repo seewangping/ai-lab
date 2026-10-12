@@ -89,8 +89,21 @@ def main() -> int:
         resp = client.post("/chat", json={"message": "", "session_id": "sess-x"}, headers=auth)
         check("POST /chat 空 message", resp.status_code, 422)
         if resp.status_code == 422:
-            first = resp.json()["detail"][0]
-            print(f"        └─ 首个错误   : loc={first['loc']} type={first['type']}")
+            body = resp.json()
+            # ⚠️ Day 6 改过这里的形状，而当时只更新了 pytest、漏了这个脚本，
+            # 一跑就 TypeError（first['loc'] 里 first 是 str）。
+            # 漏的原因是：脚本没进质量门，没人跑它就没人知道它坏了。
+            # 现在它进了 CI，所以顺手把外壳形状也断言掉——脚本的价值就在于"改坏了会红"。
+            check_true(
+                "422 使用统一错误外壳",
+                {"error", "detail", "retryable", "request_id", "errors"} <= set(body),
+                f"keys={sorted(body)}",
+            )
+            items = body.get("errors") or []
+            if items:
+                first = items[0]
+                print(f"        └─ 首个错误   : loc={first['loc']} type={first['type']}")
+                print(f"        └─ 外壳字段   : error={body['error']} retryable={body['retryable']}")
 
         # 7. 历史端点（受保护）
         resp = client.get("/chat/history/sess-smoke-001", params={"limit": 5}, headers=auth)

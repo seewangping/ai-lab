@@ -8,6 +8,17 @@ import logging
 import sys
 from datetime import datetime, timezone
 
+# LogRecord 自带的属性集合。凡是【不在这里面】的键，就是调用方通过
+# logging 的 extra= 传进来的业务字段，我们原样带进 JSON。
+#
+# 为什么值得这么干：把 method/path/status/duration_ms 塞进 msg 字符串里，
+# 日志就从"可查询的数据"退化成了"只能用眼睛看的一行字"。
+# 写成独立字段之后，日志系统可以直接按 path 分组统计、按 duration_ms 画分位线——
+# 这才是"结构化日志"四个字真正的意思。
+_RESERVED_ATTRS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+) | {"message", "asctime"}
+
 
 class JsonFormatter(logging.Formatter):
     """把每条日志渲染成一行 JSON。
@@ -24,6 +35,11 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
+        # extra= 传进来的字段原样并入。它们一定是 JSON 可序列化的简单值
+        # （调用方负责），所以这里不做转换。
+        for key, value in record.__dict__.items():
+            if key not in _RESERVED_ATTRS:
+                payload[key] = value
         if record.exc_info is not None:
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)

@@ -8,8 +8,10 @@ Day 3 起，本文件的测试【完全不碰本机 .env】：
 用固定的 X-API-Key 过鉴权。换台机器、换个人跑，结果一样。
 """
 
+import logging
 from collections.abc import Iterator
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -48,6 +50,27 @@ def fake_settings() -> Iterator[None]:
     app.dependency_overrides[get_settings_dep] = _fake_settings
     yield
     app.dependency_overrides.clear()
+
+
+def _validation_errors(resp: httpx.Response) -> list[dict[str, object]]:
+    """取 422 响应里逐条的校验明细。
+
+    Day 6 统一了错误体，结构变了：
+        before  {"detail": [{"loc": [...], "type": ..., "msg": ...}]}
+        after   {"error": "validation_error", "detail": "请求参数有 1 处不合法",
+                 "retryable": false, "request_id": "...", "errors": [{"loc": ...}]}
+
+    即 detail 从"结构化列表"变成"一句给人看的摘要"，结构化明细挪到 errors 键。
+    这一改动把所有旧的 `resp.json()["detail"][0]` 断言都打红了——**那正是它该有的效果**：
+    错误结构是客户端依赖的契约，改契约就该让测试红一次，而不是悄悄变了没人知道。
+
+    因此这个 helper 顺带断言了外壳本身（error 码 + errors 存在），
+    后面每个用例只需关心"哪几个字段错了"。
+    """
+    body = resp.json()
+    assert body["error"] == "validation_error", body
+    assert isinstance(body["errors"], list)
+    return body["errors"]
 
 
 AUTH = {"X-API-Key": TEST_API_KEY}
@@ -145,7 +168,7 @@ def test_chat_rejects_empty_message() -> None:
     resp = client.post("/chat", json={**VALID_PAYLOAD, "message": ""}, headers=AUTH)
 
     assert resp.status_code == 422
-    assert resp.json()["detail"][0]["loc"] == ["body", "message"]
+    assert _validation_errors(resp)[0]["loc"] == ["body", "message"]
 
 
 def test_chat_rejects_whitespace_only_message() -> None:
@@ -163,7 +186,7 @@ def test_chat_rejects_missing_session_id() -> None:
     resp = client.post("/chat", json={"message": "hi"}, headers=AUTH)
 
     assert resp.status_code == 422
-    error = resp.json()["detail"][0]
+    error = _validation_errors(resp)[0]
     assert error["loc"] == ["body", "session_id"]
     assert error["type"] == "missing"
 
@@ -173,7 +196,7 @@ def test_chat_rejects_unknown_field() -> None:
     resp = client.post("/chat", json={**VALID_PAYLOAD, "sessionId": "typo"}, headers=AUTH)
 
     assert resp.status_code == 422
-    assert "sessionId" in str(resp.json()["detail"])
+    assert "sessionId" in str(_validation_errors(resp))
 
 
 def test_chat_rejects_temperature_out_of_range() -> None:
@@ -181,7 +204,7 @@ def test_chat_rejects_temperature_out_of_range() -> None:
     resp = client.post("/chat", json={**VALID_PAYLOAD, "temperature": 3.5}, headers=AUTH)
 
     assert resp.status_code == 422
-    assert resp.json()["detail"][0]["loc"] == ["body", "temperature"]
+    assert _validation_errors(resp)[0]["loc"] == ["body", "temperature"]
 
 
 def test_chat_rejects_bad_session_id_pattern() -> None:
@@ -189,7 +212,7 @@ def test_chat_rejects_bad_session_id_pattern() -> None:
     resp = client.post("/chat", json={**VALID_PAYLOAD, "session_id": "会话 001"}, headers=AUTH)
 
     assert resp.status_code == 422
-    assert resp.json()["detail"][0]["loc"] == ["body", "session_id"]
+    assert _validation_errors(resp)[0]["loc"] == ["body", "session_id"]
 
 
 def test_chat_rejects_non_json_body() -> None:
@@ -206,11 +229,22 @@ def test_chat_rejects_non_json_body() -> None:
 # ---------------------------------------------------------------- Day 3: 鉴权
 
 def test_chat_without_api_key_returns_401() -> None:
-    """缺密钥 → 401，且响应体是结构化的 detail（不是 traceback）。"""
+    """缺密钥 → 401，且响应体是统一错误结构（不是 traceback）。
+
+    Day 6 之后这里断言得比以前更多：不只看"说了什么"，还看外壳对不对——
+    error 码、retryable、request_id 三样都在，客户端才可能只用一套解析逻辑。
+    """
     resp = client.post("/chat", json=VALID_PAYLOAD)
 
     assert resp.status_code == 401
-    assert resp.json() == {"detail": "缺少或错误的 X-API-Key"}
+    body = resp.json()
+    assert body["error"] == "unauthorized"
+    assert body["detail"] == "缺少或错误的 X-API-Key"
+    # 401 是调用方的问题，不该被当成"待会儿再试"
+    assert body["retryable"] is False
+    # request_id 有值 —— 它同时出现在响应头和访问日志里，是"用户截图 → 我能定位"的那根线
+    assert body["request_id"]
+    assert resp.headers["X-Request-ID"] == body["request_id"]
     assert resp.headers["WWW-Authenticate"] == "ApiKey"
 
 
@@ -298,10 +332,64 @@ def test_history_rejects_limit_over_max() -> None:
     resp = client.get("/chat/history/sess-001", params={"limit": 101}, headers=AUTH)
 
     assert resp.status_code == 422
-    assert resp.json()["detail"][0]["loc"] == ["query", "limit"]
+    assert _validation_errors(resp)[0]["loc"] == ["query", "limit"]
 
 
 def test_history_rejects_negative_offset() -> None:
     resp = client.get("/chat/history/sess-001", params={"offset": -1}, headers=AUTH)
 
     assert resp.status_code == 422
+
+
+# ------------------------------------------------------------------ 启动期接线
+# 下面这组测试守的不是"某个函数对不对"，而是"应用有没有真的把它接上"。
+# 它们的存在理由是一个实测出来的失败：setup_logging() 写得很对、测试也全绿，
+# 但应用从不调用它——于是 Day 6 的"结构化日志"在真实服务里根本不存在。
+# 这类"模块都对，就是没接线"的问题，只能由针对【接线】的断言来守。
+
+
+def test_lifespan_installs_json_logging() -> None:
+    """启动时必须把 JsonFormatter 挂到 root 上。
+
+    ⚠️ 关键在 TestClient 的用法：必须写成 `with TestClient(app)`。
+    不写 with 的话 Starlette 不会执行 lifespan，启动逻辑一行都不跑——
+    这本身是个很容易踩的坑，下面的 test_plain_testclient_does_not_run_startup
+    专门把它固定下来。
+    """
+    from ai_lab.logging_setup import JsonFormatter
+
+    with TestClient(app):
+        handlers = logging.getLogger().handlers
+        assert any(isinstance(h.formatter, JsonFormatter) for h in handlers), (
+            f"root 上没有 JsonFormatter，实际挂着：{handlers}"
+        )
+
+
+def test_plain_testclient_does_not_run_startup() -> None:
+    """不写成 with 的 TestClient 不跑 lifespan —— 所以"日志装好了没"测不出来。
+
+    这条测试是在给上面那条做注脚：它证明"不用 with 就测不到启动逻辑"，
+    从而解释为什么这个 bug 能躲过整套测试。同时也提醒后来者：
+    如果你的测试需要启动逻辑生效，用 with 把 TestClient 包起来。
+    """
+    from ai_lab.logging_setup import JsonFormatter
+
+    TestClient(app).get("/health")  # 故意不用 with
+
+    handlers = logging.getLogger().handlers
+    assert not any(isinstance(h.formatter, JsonFormatter) for h in handlers)
+
+
+def test_app_does_not_configure_logging_on_import() -> None:
+    """import 这个模块本身不该有日志副作用。
+
+    这是"模块顶层不放副作用"那条规矩的守卫：配置日志属于"运行服务"，
+    不属于"导入模块"。一旦有人把 setup_logging() 挪回模块顶层，这条会红。
+
+    同时它也解释了为什么 bug 会存在——测试里 import ai_lab.api 不会装日志，
+    所以从测试角度看"没装"是正常状态，没人会去追问。
+    """
+    from ai_lab.logging_setup import JsonFormatter
+
+    handlers = logging.getLogger().handlers
+    assert not any(isinstance(h.formatter, JsonFormatter) for h in handlers)

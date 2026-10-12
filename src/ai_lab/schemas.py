@@ -68,9 +68,35 @@ class ChatResponse(BaseModel):
     latency_ms: int = Field(ge=0, description="本次处理的耗时（毫秒）")
 
 
+class ValidationItem(BaseModel):
+    """一条参数校验失败的明细。
+
+    这三个键（loc / type / msg）和 WebSocket 错误帧里的完全一致——见 ws.py 的
+    _validation_error_frame。同一个概念在两种协议里长得一样，客户端才能用一套解析逻辑。
+    """
+
+    loc: list[str | int] = Field(description="出错位置，如 ['body', 'message']")
+    type: str = Field(description="机器可读的错误类型，如 string_too_short")
+    msg: str = Field(description="给人看的说明")
+
+
 class ErrorResponse(BaseModel):
-    """统一错误结构：Day 6 的全局异常处理器会用同样的外壳，客户端只需一套解析逻辑。"""
+    """统一错误结构：Day 6 的全局异常处理器全部产出这个外壳。
+
+    四个字段各有明确分工，不要混用：
+
+      error        稳定的机器可读码（如 upstream_rate_limited）。
+                   客户端按它写分支——**绝不要按 detail 的文案分支**，文案随时会改。
+      detail       给人看的说明。可能被本地化、被改写，不承担协议职责。
+      retryable    直接回答"要不要重试"，省得客户端去猜状态码的含义。
+      request_id   日志里能 grep 到的同一个 ID：用户截图给你，你能定位到那一整条链路。
+      errors       可选，只在参数校验失败时出现，保留逐条的定位信息。
+
+    有了 request_id 这一条，"用户说报错了"才从"我去翻半天日志"变成一次 grep。
+    """
 
     error: str
     detail: str
     retryable: bool = False
+    request_id: str | None = None
+    errors: list[ValidationItem] | None = None

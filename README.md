@@ -42,6 +42,18 @@ uv sync                   # 建虚拟环境并装依赖（需要已安装 uv）
 uv run python -m ai_lab   # 输出：Hello from ai-lab!
 ```
 
+起服务（`--no-access-log` 不是可选项，理由见「服务端日志」一节）：
+
+```bash
+# 开发（改代码自动重载）
+uv run uvicorn ai_lab.api:app --reload --reload-dir src
+
+# 想看结构化日志时：两条流分开重定向，stdout 就是干净的 JSON 日志
+uv run uvicorn ai_lab.api:app --no-access-log > /tmp/app.jsonl 2> /tmp/uvicorn.err
+```
+
+交互式接口文档在 <http://127.0.0.1:8000/docs>（`/ws/chat` 不会出现在里面，WS 不进 OpenAPI）。
+
 `.env` 里有两把**职责不同、必须不同**的钥匙：
 
 | 变量 | 用途 | 谁看得到 |
@@ -61,20 +73,32 @@ uv run mypy src/ tests/
 uv run pytest -q --cov=ai_lab --cov-report=term-missing
 ```
 
-当前状态：`mypy` 21 个文件零报错；`pytest` 105 个用例全过，覆盖率 **100%**。
+当前状态：`mypy` 27 个文件零报错（scripts 另 9 个，需 `MYPYPATH=src`）；`pytest` **150** 个用例全过，
+覆盖率 **100%**（492 条语句）。CI 在 `ubuntu-latest` 上跑 Python 3.12 与 3.13 两遍。
 
-端到端另有两层手动验证（需要服务在跑，`uvicorn ai_lab.api:app --port 8000` 另开一个窗口）：
+端到端另有一层手动验证（需要服务在跑，**建议按下面这条命令起**，理由见「服务端日志」一节）：
 
 ```bash
-uv run python scripts/smoke_api.py            # HTTP：14 项冒烟（鉴权/校验/流式/响应头）
-uv run python scripts/ws_client_demo.py       # WS：12 项真实客户端验证（握手拒绝/广播/双向）
-uv run python scripts/probe_stream_timing.py  # 时序对照：TestClient 全是 0.000s，真实 HTTP 才有间隔
+# 关键：--no-access-log 关掉 uvicorn 内置的纯文本访问日志；两条流分开重定向
+uv run uvicorn ai_lab.api:app --port 8000 --no-access-log > /tmp/app.jsonl 2> /tmp/uvicorn.err
 ```
 
-> **为什么这两层缺一不可**：TestClient 不经过真实网络栈——协议升级、帧编解码、
+```bash
+uv run python scripts/smoke_api.py              # HTTP：15 项冒烟（鉴权/校验/流式/响应头）
+uv run python scripts/ws_client_demo.py         # WS：12 项真实客户端验证（握手拒绝/广播/双向）
+uv run python scripts/probe_error_contract.py   # 错误契约：64 项断言（7 种错误源 + 框架侧错误）
+uv run python scripts/check_json_logs.py /tmp/app.jsonl   # 日志格式：每行必须合法 JSON 且字段齐全
+uv run python scripts/probe_stream_timing.py    # 时序对照：TestClient 全是 0.000s，真实 HTTP 才有间隔
+```
+
+> **为什么这几层缺一不可**：TestClient 不经过真实网络栈——协议升级、帧编解码、
 > 缓冲全被跳过。「被拒绝的握手，客户端到底看到什么」这类问题它答不了。
 > 实测：TestClient 里握手被拒是 `WebSocketDisconnect`，真实客户端拿到的是
 > **HTTP 403**（`InvalidStatus`）——同一个行为，两种表现。Day 4 的 SSE 时序也有同样的坑。
+>
+> 而 `check_json_logs.py` 保护的是**比协议更靠外的一层**：它读的是真实服务写出的
+> 那个文件。有些问题在测试里根本无法证伪，因为测试可以自己把环境摆好——
+> 详见「服务端日志：一个测试永远发现不了的坑」。
 
 ### 在 Git Bash 终端里怎么跑、怎么看结果
 
@@ -193,6 +217,191 @@ WebSocket 不属于它。所以 WS 端点必须**手工写文档**（就是下�
 `X-API-Key` 正常可用——所以 `ws.py` 里两个来源都支持，请求头优先。
 这条限制是本项目把凭据拆成 `CLIENT_API_KEY`（可轮换）而不是直接用上游密钥的又一个理由。
 
+## 统一错误契约（Day 6）
+
+目标只有一句：**客户端永远拿到同一种 JSON 外壳，永远不会看到裸 traceback。**
+麻烦在于异常会从四个彼此不相干的地方冒出来，而它们本该长得一样：
+
+| 来源 | 谁抛的 | 处理器 | 典型状态码 |
+|---|---|---|---|
+| ① 业务异常 | 我们的 `AppError` 子类（W3 接 LLM 后是主要来源） | `app_error_handler` | 由异常类决定 |
+| ② 请求体校验 | FastAPI 的 `RequestValidationError` | `validation_error_handler` | 422 |
+| ③ HTTP 层 | 框架/路由抛的 `StarletteHTTPException`（404、405、401） | `http_exception_handler` | 原样透出 |
+| ④ 谁都没接住 | 任何 bug（`KeyError`、`TypeError`……） | `unhandled_error_handler` | 500 |
+
+外壳长这样（四个来源**完全同构**）：
+
+```json
+{
+  "error": "upstream_rate_limited",
+  "detail": "上游限流",
+  "retryable": true,
+  "request_id": "bbfbd986b541"
+}
+```
+
+`errors` 数组只在 422 时出现（客户端要靠它逐字段报错），结构与 WS 错误帧**刻意同构**
+（同样是 `loc`/`type`/`msg`），这样客户端能用一套解析逻辑处理两种协议。
+
+### 状态码怎么定：类上显式写 > 按可重试兜底
+
+```python
+def http_status_for(exc: AppError) -> int:
+    if exc.http_status is not None:
+        return exc.http_status
+    return 503 if exc.retryable else 500
+```
+
+`LLMServerError` **故意不声明** `http_status`，用来让兜底分支成为活代码——否则
+"兜底逻辑"只是没人走过的死分支。`scripts/probe_error_contract.py` 里
+`upstream` 那一条就是专门验证它的（断言 503）。
+
+两个不显然的决策：
+
+- **`LLMAuthError` 返回 500，而不是把上游的 401 透传给客户端。** 上游 401 的意思是
+  "服务端自己的密钥不对"——这是**我们的配置故障**，不是调用方的问题。透传 401 会让
+  调用方以为是自己没带凭据，然后去改一个根本没问题的 header。
+- **`LLMInsufficientBalanceError` 是 503，但没有 `Retry-After`。** 状态码说"暂时不可用"，
+  而"余额不足"不会因为等一会儿就好了。给它 `Retry-After` 等于教客户端白重试。
+  实测输出：`rate-limit/timeout/upstream` 三个有 `Retry-After: 1`，
+  `balance/auth/bad-request/unhandled` 四个没有。
+
+### 三个"被测试逼出来"的细节
+
+写统一响应最容易丢的是**响应头**，这三条都是先出问题后补的：
+
+1. **401 的 `WWW-Authenticate` 必须保住**。换成自定义 JSON 响应后 `deps.py` 设的
+   `WWW-Authenticate: ApiKey` 消失了——RFC 9110 要求 401 必须带它，丢了它不只是少个
+   字段，而是让"客户端该怎么带凭据"失去标准表达（浏览器弹密码框、部分 SDK 的自动重试
+   都靠它）。修法：`_json_error` 把 `exc.headers` 原样带上。
+2. **`X-Request-ID` 要两侧都写**。未处理异常的 500 由最外层的 `ServerErrorMiddleware`
+   直接发出，**根本不经过我们的中间件**，所以那一条响应上中间件没机会加头——而它恰恰
+   是最需要拿 request_id 去查日志的那一条。修法：`_json_error` 也写，
+   中间件侧 `setdefault` 去重，并加回归测试断言 `X-Request-ID` **恰好一个**
+   （两个同名头会被客户端拼成逗号串，拿着它查不到日志）。
+3. **422 的 `errors` 只能保留 `loc`/`type`/`msg`**。`exc.errors()` 里的 `ctx` 可能含
+   不可 JSON 序列化的对象，整包塞进 `JSONResponse` 会直接抛 `TypeError`——
+   "想报 422"变成"报 500"。
+
+### HTTPException 还是自定义异常？
+
+判断标准一句话：**这个错误在"没有 HTTP"的世界里还有意义吗？**
+
+- 有 → `AppError`。`errors.py` 里连 `import fastapi` 都没有，状态码只是普通 int，
+  所以同一套异常在 CLI、消息队列消费者、批处理里都能用；只有"暴露成 HTTP"时才需要
+  一个翻译器（就是 `handlers.py`）。
+- 没有 → `HTTPException`。404 路由不存在、405 方法不对，这些概念在非 HTTP 场景里
+  根本不存在，硬造成 `AppError` 是给自己加翻译负担。
+
+注册时注意**要注册 Starlette 的 `HTTPException` 父类**：路由没匹配上时框架抛的是父类，
+只注册 FastAPI 那个子类的话 404 会绕过我们，长回默认的 `{"detail": "Not Found"}`。
+
+## 请求上下文中间件（Day 6）
+
+`RequestContextMiddleware` 干两件事：给每个请求生成 `request_id` 放进
+`scope["state"]`，以及**每个请求输出恰好一行**结构化访问日志：
+
+```json
+{"time": "2026-10-12T07:11:02.950338+00:00", "level": "INFO", "logger": "ai_lab.middleware",
+ "msg": "请求完成", "request_id": "be7d3fc9ce3a", "method": "GET", "path": "/health",
+ "http_status": 200, "duration_ms": 34.786}
+```
+
+字段是**独立的键**而不是拼进消息字符串——这是"结构化日志"四个字的实际含义：
+`path` 可以直接分组、`duration_ms` 可以直接求分位线。拼进 msg 就只能用眼睛看。
+
+级别按状态码分：5xx 用 `ERROR`，其余用 `INFO`。**这个区分直接决定告警有没有用**——
+把 400 也打成 error，报警群很快就被"正常营业噪音"淹掉，真故障反而没人看。
+
+### 为什么是纯 ASGI 中间件，而不是 `BaseHTTPMiddleware`
+
+教科书说法是"`BaseHTTPMiddleware`（`@app.middleware("http")`）会破坏流式响应的时序"。
+本项目**实测了一遍**（`scripts/probe_middleware_vs_sse.py`，自动起服务、带预热排除冷启动、
+只统计 token→token 间隔）：
+
+| 写法 | token 帧 | 总帧数 | 首字延迟 | 总时长 |
+|---|---|---|---|---|
+| 无中间件（基线） | 66 | 68 | ~0.12–0.14s | 4.16–4.19s |
+| 纯 ASGI 中间件 | 66 | 68 | ~0.12–0.14s | 4.16–4.19s |
+| `BaseHTTPMiddleware` | 66 | 68 | ~0.12–0.14s | 4.16–4.19s |
+
+**在 starlette 1.7.0 上三者没有可观测差异**——这个结论与该说法的流传版本相反，
+所以脚本里如实写了这一点，而不是把流行说法抄成结论。
+
+那为什么还是选纯 ASGI？理由变成"职责清晰、少一层不可见抽象"，而不是"为了性能"：
+`BaseHTTPMiddleware` 内部要起 anyio 任务组、包一层 `_StreamingResponse`、
+对 `request` 对象做重包装，这些在你的调用栈里都看不见，出问题时要多扒两层才能定位。
+**以性能为名做选择时，先把性能量出来；量不出来就换个诚实的理由。**
+
+顺带一提，基线（"无中间件"）第一次跑出来是最慢的（TTFT 0.905s）——那是**冷启动被
+错误归因**了。加一次丢弃结果的预热调用后基线降到 0.120s。这类"测出来的结论其实是
+测量方法的产物"，在写性能对比时是最常见的坑。
+
+## 服务端日志：一个测试永远发现不了的坑
+
+**这里的结论是实测出来的，而且测试全绿时它就存在。**
+
+`setup_logging()` 原先只在 `logging_setup.py` 自己的 `__main__` 块和各测试用例里
+被调用——**应用自己从不调用**。于是真实服务里：
+
+- `ai_lab.*` 的日志落到 `logging.lastResort`（只在"整条继承链上一个 handler 都没有"时
+  生效，恰好是这种情况）。它的行为是：**只处理 WARNING 及以上、纯文本、写往 stderr**。
+  - 中间件的 INFO 访问日志 → **整条被丢弃**。"每个请求一行日志"当场不成立。
+  - 400 那类 WARNING → 打出来了，但**没有 JSON 外壳**，纯文本，JSON 采集器必然解析失败。
+- uvicorn 自己的日志照旧正常（`uvicorn.error` 的传播链在 `uvicorn.propagate = False`
+  处被切断，到不了 root）。**这恰恰掩盖了问题**——日志里"看着有东西"。
+
+为什么整套测试都没发现：**测试自己调了 `setup_logging()`。**测试验的是"某份配置是对的"，
+服务跑的是"另一份配置"。这类问题无法用测试证伪，因为任何断言都可以被"测试自己把环境
+摆好"绕过去。只有读**真实服务写出来的那个文件**才行——所以有了 `scripts/check_json_logs.py`，
+以及 CI 里那一项 `logs=`。
+
+修法是用 `lifespan`（而不是模块顶层）调用 `setup_logging()`，三个理由：
+① 避免导入副作用——`import` 一个模块不该改全局日志配置；
+② 时机要晚于 uvicorn 的 `dictConfig`；
+③ 这是唯一能让"每请求一行"在真实服务里成立的地方。
+
+### 两条流是分开的，要分开重定向
+
+| 流 | 谁写 | 格式 | 归属 |
+|---|---|---|---|
+| **stdout** | 我们的 `JsonFormatter` | JSON | 采集端只需要管这一条 |
+| **stderr** | uvicorn 的 `default` handler | 纯文本 + traceback | 框架自己的事 |
+
+实测一次 `/demo/errors/unhandled`：stdout 10 行（其中 ERROR 只有 2 条：中间件 1 + 异常
+处理器 1），stderr 82 行纯文本。**干净分离，没有互相污染。**
+
+⚠️ 唯一的例外是 uvicorn 内置的**访问日志**，它自己也写 stdout 且是纯文本。实测对照：
+
+```bash
+# 不加 --no-access-log → stdout 里一半的行不可解析
+INFO:     127.0.0.1:60859 - "GET /health HTTP/1.1" 200 OK
+{"time": "...", "msg": "请求完成", "request_id": "be7d3fc9ce3a", ...}
+
+# 加 --no-access-log  → 全部是 JSON
+```
+
+关掉它也不亏，我们自己的那条信息量严格更大：
+
+| 字段 | `uvicorn.access` | `ai_lab.middleware` |
+|---|---|---|
+| `request_id` | 无 | 有（12 位十六进制，可去日志里捞 traceback） |
+| `duration_ms` | 无 | 有（可求分位线） |
+| 能否被日志系统查询 | 不能（纯文本） | 能（JSON 字段） |
+
+两条访问日志等于同一件事付两次钱，而且能查询的那条是我们的。
+
+### 一次未处理异常会有 3 份 traceback
+
+中间件 1 份（带 `duration_ms` + `request_id` 的"请求视角"）、异常处理器 1 份
+（带 `error` 码的"语义视角"）、uvicorn 1 份（框架兜底，**关不掉**）。
+我们只能控制前两份，而它们信息侧重不同，所以都保留。这个代价要知道，不用试图消除。
+
+> **⚠️ 顺手记一个 Windows 上的坑**：Git Bash 的 `/tmp` 映射到
+> `C:\Users\<你>\AppData\Local\Temp`，但 Windows 版 Python 会把 `/tmp/x.json`
+> 解析成 `C:\tmp\x.json` → `FileNotFoundError`。跨工具传路径时先 `cygpath -w /tmp`
+> 拿真实路径。（这个坑让一次 curl 巡检的 `code=` 列全空，排查了一阵才发现是路径问题。）
+
 ## 补充材料（写给 C# 出身的自己）
 
 - `docs/python-syntax-for-csharp-devs.md` —— **读码五步法** + C#↔Python 语法对照表 + 本项目真实代码的逐行解码
@@ -234,6 +443,7 @@ docker compose run --rm app
 | `MAX_CONCURRENT` | | `5` | 并发上限，由信号量控制 |
 | `MAX_RETRIES` | | `3` | 可重试异常的最大重试次数 |
 | `STREAM_DELAY_MS` | | `20` | 流式 token 间隔（毫秒）。W3 接真实模型后失效，测试里置 0 让用例秒过 |
+| `DEMO_ROUTES_ENABLED` | | `true` | 是否挂载 `/demo/errors/{kind}` 调试端点。**生产应置 false**（关闭后返回 404，像不存在一样） |
 
 必填项缺失时应用**启动即报错**（fail fast），不会拖到第一次调用。
 取值优先级：**命令行环境变量 > `.env` 文件 > 类里的默认值**。字段名与变量名大小写不敏感（`llm_timeout` ↔ `LLM_TIMEOUT`）。
@@ -254,6 +464,13 @@ docker compose run --rm app
 - **可变全局状态包成依赖**：`ConnectionManager` 是模块级单例（WS 连接是**有状态**的，服务端必须记住谁在线），但它被包成 `get_manager()` 依赖——于是每个测试用例能换上全新实例，不会互相污染。这是 Day 3 那套依赖注入的第二次收益
 - **WS 的错误协议要自己发明**：WS 里没有 422（状态码是 HTTP 概念）。本项目刻意让错误帧与 REST 的 422 响应体**同构**（同样是 `loc`/`type`/`msg`），客户端才能用一套解析逻辑处理两种协议；并且一次坏输入不会断开连接，可以继续对话
 - **WS 的流式不需要发明协议**：直接一条条 `send_json` 即可，没有 `data:` 前缀、没有空行分隔符、没有多行前缀坑。代价是重连、序号、心跳全得自己写——这是 SSE 与 WS 权衡里最直观的一条
+- **统一错误外壳**：四类异常来源（业务异常 / 请求体校验 / HTTP 层 / 未处理）经四个处理器产出**同构**的 JSON；`_json_error` 是唯一出口，想改结构只改一处
+- **意外异常绝不回显**：`unhandled_error_handler` 的对外文案是固定常量，异常内容只进日志（用 `request_id` 捞回来）。真实事故就是这么泄露的——某个上游 SDK 把请求体拼进异常消息，而异常被透传给了客户端。`/demo/errors/unhandled` 故意在异常里塞了假密钥和假路径，并由 `probe_error_contract.py` 断言响应里一个字都不出现
+- **响应头也要一起统一**：写"统一响应"最容易丢的就是头。401 的 `WWW-Authenticate`（RFC 9110 要求）与每个响应的 `X-Request-ID` 都得显式带上，后者还要在中间件侧 `setdefault` 去重——因为未处理异常的 500 由最外层框架发出，不经过我们的中间件
+- **错误码是机器可读的稳定标识**：`error` 字段（如 `upstream_rate_limited`）与 `detail` 文案分离。文案可以随便改、可以翻译，`error` 码改了就是破坏性变更——客户端应该 `switch (error)`，而不是去匹配人话
+- **每个请求一行结构化日志**：字段是独立的 JSON 键（`request_id`/`method`/`path`/`http_status`/`duration_ms`），能被日志系统直接分组与求分位；级别按状态码分（5xx→ERROR，其余→INFO），这个区分决定告警有没有用
+- **日志在 `lifespan` 里配置，不在模块顶层**：避免 import 副作用，且时机晚于 uvicorn 的 `dictConfig`。这条是实测发现的——原先应用从不调用 `setup_logging()`，测试全绿而真实服务里访问日志被 `logging.lastResort` 整条丢弃
+- **两条流分开**：我们的 JSON 走 stdout，uvicorn 自己的纯文本走 stderr。配合 `--no-access-log` 关掉框架内置访问日志，采集端只需面对一种格式
 
 ## 已知限制
 
@@ -269,3 +486,7 @@ docker compose run --rm app
 10. **凭据放查询参数会进访问日志**：浏览器场景的无奈之举（`new WebSocket()` 设不了请求头）。生产环境需要在反向代理与日志采集层面做 URL 脱敏，或改用"连上后先发鉴权消息"的方案。
 11. **目前的流式是"传输层真、生成层假"**：`build_reply` 返回 `str`，因此在发出第一个 token 之前整段回复已经生成完毕；`tokenize` 里的 `sleep` 只是把成品慢慢放出来，并不能让上游提前产出。同一个模型成本下实测（`scripts/probe_real_vs_fake_streaming.py`）：**假流式首字延迟 2.11s vs 真流式 0.30s（7 倍）**，总时长还多花 1.79s——生成时间被付了两遍（一遍真等模型，一遍假等节奏）。占位模型瞬间返回，所以本地看不出来。**W3 接真实模型时必须把流式入口改成 `AsyncIterator[str]`，否则首字延迟原封不动地翻上去。**
 12. **`asyncio.sleep` 在 Windows 上会向上取整到 15.6ms 的整数倍**（实测 20ms → 31.7ms、50ms → 63.0ms）。所以本机 `STREAM_DELAY_MS=20` 的实际节奏约 31ms/token；Linux 事件循环无此问题，属"本地看着坏、线上是好的"。影响范围主要在未来若用它做重试退避 / 心跳周期 / 限流窗口时，每次会多睡最多 15.6ms，累积成偏差。
+13. **必须用 `--no-access-log` 起服务**：uvicorn 内置访问日志也写 stdout 且是纯文本，不关掉的话 stdout 会被两种格式混在一起（实测一半的行无法解析），`check_json_logs.py` 会（正确地）失败。目前靠"文档 + CI 命令"约束，**应用内部无法强制**——如果接入容器编排，记得把该参数写进启动命令。
+14. **一次未处理异常会产生 3 份 traceback**：中间件 1 份、异常处理器 1 份、uvicorn 兜底 1 份（框架这层关不掉）。前两份信息侧重不同（请求视角 vs 语义视角），故保留；代价是错误日志量约为正常情况的 3 倍。
+15. **`/demo/errors/{kind}` 是调试端点**，用于验证错误契约；生产应把 `DEMO_ROUTES_ENABLED` 设为 false（关闭后这些路径返回 404，表现得像不存在）。
+16. **`request_id` 是 12 位十六进制而非完整 UUID**：够用（碰撞概率可忽略）、且能安全放进 HTTP 头（头是 latin-1 编码，非 ASCII 值会直接抛 `UnicodeEncodeError`——写测试时把中文塞进 header 就会踩到）。同时它只用于**关联日志**，不承载任何业务含义。

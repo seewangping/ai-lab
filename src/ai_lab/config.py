@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # "配置驱动的行为可以被测试"的实际用途，而不是为了好看。
     stream_delay_ms: float = Field(default=20.0, ge=0.0)
 
+    # 演示/自测端点（/demo/...）的开关。默认开着，因为它就是给这个练习项目用的；
+    # 真上线时要设成 False —— 这类端点会主动抛异常，留在生产里等于给别人
+    # 一个"随便让服务出错"的入口。用一个开关而不是注释掉代码，
+    # 是为了让"生产必须关掉"这件事变成一条可检查的配置，而不是一句口头约定。
+    demo_routes_enabled: bool = True
+
     @model_validator(mode="after")
     def _keys_must_differ(self) -> "Settings":
         """两把钥匙不能是同一个值——相同就等于没拆，拆了个寂寞。
@@ -93,6 +99,7 @@ def call() -> None:
     print(f"llm_timeout    = {s.llm_timeout}")
     print(f"max_concurrent = {s.max_concurrent}")
     print(f"max_retries    = {s.max_retries}")
+    print(f"demo_routes    = {s.demo_routes_enabled}   （上线前应为 False）")
 
 
 # __main__ 守卫：直接运行本文件才打印，被 import 时静默。
