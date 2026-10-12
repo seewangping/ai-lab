@@ -34,7 +34,16 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: 安装 uv（并准备对应版本的 Python）
-        uses: astral-sh/setup-uv@v10
+        # 钉到【完整版本号】而不是 v10：这个 action 没有浮动 major tag。
+        # 实测三个 ref 的存在性（gh api repos/astral-sh/setup-uv/git/ref/tags/<ref>）：
+        #   v5       → refs/tags/v5        ✅ 存在（所以最初 @v5 能跑）
+        #   v9       → 404                 ❌
+        #   v10      → 404                 ❌   ← 写 @v10 直接报 unable to find version
+        #   v10.3.0  → refs/tags/v10.3.0   ✅
+        # 也就是说它在 v9 之后不再发布浮动 major tag 了。
+        # 顺带一提，钉完整版本本来就比钉 major 更该做：浮动 tag 会在你不知情时变，
+        # 跟"依赖不锁版本"是同一类问题。代价是要手动升（可交给 Dependabot）。
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           # 锁到与开发机相同的版本：uv 的解析行为会随版本变化，
           # CI 与本地用不同版本，"本地能装、CI 装不上"这类问题就无从排查
@@ -93,7 +102,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: 安装 uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           version: "0.12.10"
           python-version: "3.13"
