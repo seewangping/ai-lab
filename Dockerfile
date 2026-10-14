@@ -50,4 +50,24 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 USER appuser
 
-CMD ["python", "-m", "ai_lab"]
+EXPOSE 8000
+
+# 用 /health 做存活探针（该端点免鉴权，专门为此存在）。
+# slim 镜像里没有 curl，所以用 Python 标准库发请求：成功则退出码 0，异常则非 0。
+# 不引额外依赖——健康检查不该成为镜像变大的理由。
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+
+# 启动命令的三个要点，都是实测逼出来的，不是从模板抄的：
+#
+# 1. --host 0.0.0.0 必须写。uvicorn 默认只监听 127.0.0.1，
+#    即使 -p 8000:8000 端口映射正确，容器外也连不进来。
+#    症状是"镜像明明跑起来了却访问不到"，很容易误判成防火墙问题。
+#
+# 2. --no-access-log 必须写。uvicorn 内置的访问日志也写 stdout 且是纯文本，
+#    会把我们输出的 JSON 日志流污染掉——本机实测不关的话 stdout 里
+#    一半的行无法被 JSON 采集器解析。我们中间件那条信息量严格更大
+#    （带 request_id + duration_ms），留着框架那条等于同一件事记两遍。
+#
+# 3. 不要加 --reload。那是开发期热重载用的；容器里要的是稳定、可预测的进程。
+CMD ["uvicorn", "ai_lab.api:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

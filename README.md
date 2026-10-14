@@ -39,7 +39,7 @@ ai-lab/
 ```bash
 cp .env.example .env      # 然后把两把钥匙改成你自己的值（必须是两个不同的值）
 uv sync                   # 建虚拟环境并装依赖（需要已安装 uv）
-uv run python -m ai_lab   # 输出：Hello from ai-lab!
+uv run python -m ai_lab   # 冒烟：W1 留下的最小入口，只打印一行，用来确认包能导入
 ```
 
 起服务（`--no-access-log` 不是可选项，理由见「服务端日志」一节）：
@@ -89,7 +89,11 @@ uv run python scripts/ws_client_demo.py         # WS：12 项真实客户端验�
 uv run python scripts/probe_error_contract.py   # 错误契约：64 项断言（7 种错误源 + 框架侧错误）
 uv run python scripts/check_json_logs.py /tmp/app.jsonl   # 日志格式：每行必须合法 JSON 且字段齐全
 uv run python scripts/probe_stream_timing.py    # 时序对照：TestClient 全是 0.000s，真实 HTTP 才有间隔
+uv run python scripts/probe_sleep_granularity.py  # 睡眠精度：不需要服务，可直接单独跑
 ```
+
+> 前 5 条都需要服务在跑（`probe_stream_timing.py` 尤其需要——它就是用来揭穿
+> TestClient 的时序假象的）；只有最后一条 `probe_sleep_granularity.py` 是纯本地测量。
 
 > **为什么这几层缺一不可**：TestClient 不经过真实网络栈——协议升级、帧编解码、
 > 缓冲全被跳过。「被拒绝的握手，客户端到底看到什么」这类问题它答不了。
@@ -170,6 +174,43 @@ uv run pytest -q | tail -3            # ❌ 退出码来自 tail，永远是 0
 ⚠️ **`/ws/chat` 不会出现在 `/docs` 里**——OpenAPI 规范只描述 HTTP 请求/响应，
 WebSocket 不属于它。所以 WS 端点必须**手工写文档**（就是下面这段），
 这不是配置没调好，是规范本身的边界。
+
+### curl 示例（可直接复制）
+
+```bash
+# 从 .env 取出对外凭据。注意拿的是 CLIENT_API_KEY（对外），不是 LLM_API_KEY（上游）
+KEY=$(grep '^CLIENT_API_KEY=' .env | cut -d= -f2)
+
+# 存活探针（免鉴权）
+curl -s http://127.0.0.1:8000/health
+# {"status":"ok"}
+
+# 路径参数 + 查询参数
+curl -s "http://127.0.0.1:8000/greet/wang?excited=true"
+
+# 对话（非流式）
+curl -s -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $KEY" \
+  -d '{"message":"你好","session_id":"sess-1"}'
+
+# 对话（流式）。-N 必须有——不加的话你看到的是 curl 在缓冲，不是服务端的问题
+curl -sN -X POST http://127.0.0.1:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $KEY" \
+  -d '{"message":"你好","session_id":"sess-1"}'
+
+# 故意漏掉凭据，看统一错误外壳（-i 连响应头一起看）
+curl -si -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"x","session_id":"s"}' | head -14
+
+# WebSocket 不进 OpenAPI，只能用真实客户端测
+uv run python scripts/ws_client_demo.py
+```
+
+`session_id` 是必填的（有格式约束），漏了会拿到 422——正好可以顺手看一眼
+`errors` 数组是怎么逐字段定位的。
 
 ## SSE vs WebSocket：为什么聊天回复选 SSE
 
@@ -405,18 +446,24 @@ INFO:     127.0.0.1:60859 - "GET /health HTTP/1.1" 200 OK
 ## 补充材料（写给 C# 出身的自己）
 
 - `docs/python-syntax-for-csharp-devs.md` —— **读码五步法** + C#↔Python 语法对照表 + 本项目真实代码的逐行解码
+- `docs/sse-streaming-pitfalls.md` —— **SSE 流式响应的 8 个坑**。每条都是本项目实测的，包括
+  「`X-Accel-Buffering` 到底在哪种部署形态下才起作用」「SSE 协议里为什么没有结束标记」这两个
+  容易只停留在「听说过」层面的问题。也记了一个**被实测否掉的流行说法**（`BaseHTTPMiddleware` 破坏流式）
 - `scripts/syntax_tour.py` —— 13 节可运行的语法导览，每节都有 C# 对照和打印出来的证据
+- `scripts/probe_sleep_granularity.py` —— 量 `asyncio.sleep` 与 `time.sleep` 的实际精度，
+  并**反推**平台粒度（而不是硬编码 15.6ms）
 
 ```bash
 uv run python scripts/syntax_tour.py        # 跑全部
 uv run python scripts/syntax_tour.py 4 8    # 只看推导式和装饰器
+uv run python scripts/probe_sleep_granularity.py   # 不需要起服务，可直接跑
 ```
 
 ## Docker 运行
 
 ```bash
 docker build -t ai-lab:dev .
-docker run --rm --env-file .env ai-lab:dev
+docker run --rm -p 8000:8000 --env-file .env ai-lab:dev
 ```
 
 开发期改代码不用重新构建（compose 挂载了 `./src`）：
@@ -431,6 +478,75 @@ docker compose run --rm app
 - **非 root 运行**：以 `uid=1000(appuser)` 启动
 - **密钥不进镜像**：`.env` 通过 `--env-file` / `env_file` 在运行时注入，镜像里不存在该文件
 - **依赖层可长期缓存**：`pyproject.toml` + `uv.lock` 先于源码被 COPY，改代码不会触发重新装依赖
+- **`HEALTHCHECK`**：用 `/health` 做存活探针。slim 镜像里没有 curl，所以用 Python 标准库发请求，不为此引入依赖
+- **启动命令写死 `--no-access-log`**：见下方「启动命令的两个必写参数」
+
+### 启动命令的两个必写参数
+
+这两条都是实测出来的，缺一个都会以「本地好好的、容器里不对」的形式出现：
+
+```dockerfile
+CMD ["uvicorn", "ai_lab.api:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+```
+
+| 参数 | 不写会怎样 | 为什么 |
+|---|---|---|
+| `--host 0.0.0.0` | `-p 8000:8000` 映射正确也连不上 | uvicorn 默认只监听 `127.0.0.1`（回环）。容器外访问不到，而镜像本身「运行正常」，很容易误判成防火墙问题 |
+| `--no-access-log` | stdout 里一半的行不是合法 JSON | uvicorn 内置访问日志也写 stdout 且是**纯文本**。我们中间件那条信息量严格更大（带 `request_id` + `duration_ms`），留着框架那条等于同一件事记两遍、还毁掉日志格式 |
+
+实测证据（容器起来后 `docker logs` 的两条流分开）：
+
+```
+stdout 9 行  → 全部合法 JSON，check_json_logs.py 退出码 0
+stderr 4 行  → 全部是 uvicorn 自己的启动消息（纯文本）
+              INFO:     Uvicorn running on http://0.0.0.0:8000   ← 证明 --host 生效
+```
+
+stderr 里**没有**访问日志行，stdout 里**没有**纯文本行——两条流各归各位。
+
+### 怎么复核上面这些说法
+
+不必信文档，下面这些命令都可以直接跑：
+
+```bash
+# 起容器并等就绪
+docker run -d --name ailab-test -p 8020:8000 \
+  -e CLIENT_API_KEY=test-client -e LLM_API_KEY=test-upstream ai-lab:dev
+
+# 证明了 --host 0.0.0.0 与端口映射都对
+curl -s http://127.0.0.1:8020/health
+
+# 证明运行身份非 root（应输出 uid=1000(appuser)）
+docker exec ailab-test id
+
+# 证明镜像里没有开发工具
+docker exec ailab-test sh -c 'command -v uv pytest mypy || echo 都没装'
+
+# 证明密钥没进镜像。注意要精确匹配：grep -i env 会被 .venv 匹配到（venv 含 "env"）
+docker run --rm ai-lab:dev sh -c 'ls -a /app | grep -x "\.env" || echo 镜像内无 .env'
+
+# 证明 stdout 是纯 JSON（把两条流分开取再校验）
+docker logs ailab-test 1>stdout.txt 2>stderr.txt
+uv run python scripts/check_json_logs.py "$(cygpath -w stdout.txt)"
+
+docker rm -f ailab-test
+```
+
+### 构建耗时（本机实测）
+
+| 场景 | 耗时 | 说明 |
+|---|---|---|
+| 零改动重构建 | **17s**（15/17/18，中位 17） | 全部层命中缓存，这就是本机的固定开销 |
+| 改一行源码后重构建 | **24s**（25/24/24，中位 24） | 只有 `COPY src/` 之后的层失效 |
+| **差值** | **≈7s** | 这才是「改代码的代价」 |
+
+⚠️ 第一次构建（Docker 刚启动、缓存与磁盘都凉）会慢得多——实测首次数到 50s。
+**别拿第一次的数当基线**：我在做上面这张表时先踩了这个坑，第一次测出「零改动 48s」而
+「改代码 26s」这种自相矛盾的数，加了两次预热后才是上表结果。
+这和「以性能为名做选择时，先把性能量出来」是同一条纪律的延伸：**量的时候先排除冷启动。**
+
+镜像体积 **235MB**（Python 3.12/3.13 + fastapi + uvicorn[standard] 全量依赖）。
+想更小可以去 `uvicorn[standard]` 里的 uvloop / httptools / watchfiles（后者容器里用不到）。
 
 ## 环境变量
 
@@ -479,14 +595,14 @@ docker compose run --rm app
 3. **覆盖率有排除项**：`async_demo.py`（可执行实验脚本）与各模块 `if __name__ == "__main__":` 下的本地演示代码不计入覆盖率，已在 `pyproject.toml` 中显式声明。库逻辑本身无排除。
 4. **配置对象被 `lru_cache` 缓存**：进程运行期间修改环境变量不会生效；测试里需 `get_settings.cache_clear()`。
 5. **容器内用 `PYTHONPATH=/app/src` 而非 editable 安装**：editable 安装会在源码变化时改写 `.venv` 内的 `.pth` / `dist-info`，导致 20MB 的依赖层被连带失效、重构建变慢。代价是镜像里没有 `ai-lab` 控制台脚本，只能用 `python -m ai_lab`。
-6. **Windows + WSL2 下构建有约 23 秒固定开销**（零改动全缓存构建的耗时）。开发期请用 `docker compose` 挂载源码，不要靠反复 `docker build` 迭代。
+6. **Windows + WSL2 下构建有约 17 秒固定开销**（零改动全缓存构建的中位耗时；改一行源码约 24 秒，**差值约 7 秒**）。开发期请用 `docker compose` 挂载源码，不要靠反复 `docker build` 迭代——挂载后改代码的重建时间是 0 秒。⚠️ 首次构建（Docker 刚起）会慢到 50s 量级，做基线对比前必须先预热，否则会得出自相矛盾的数（详见「Docker 运行 → 构建耗时」）。
 7. **默认 PyPI 源指向清华镜像**（`[[tool.uv.index]]`，为国内网络环境配置）。海外网络下可删除该项以走官方源。
 8. **WS 连接管理器是单进程内存态**：`ConnectionManager` 的集合只存在于当前进程。多 worker（`uvicorn --workers N`）或 K8s 多副本下，广播只能送达**本进程**的连接——跨进程广播需要 Redis pub/sub 之类的消息中间件。和已知限制 2（信号量限流）是同一类问题：**进程内状态在多实例部署下失效**。
 9. **WS 没有重连、续传和业务序号协议**：客户端断开后要自己重连、自己去重、自己决定"从哪继续"。服务端发的 `index` 只是本连接的帧序号，不是可续传的消息 ID。要做断点续传得自己设计消息 ID + 服务端缓存。
 10. **凭据放查询参数会进访问日志**：浏览器场景的无奈之举（`new WebSocket()` 设不了请求头）。生产环境需要在反向代理与日志采集层面做 URL 脱敏，或改用"连上后先发鉴权消息"的方案。
 11. **目前的流式是"传输层真、生成层假"**：`build_reply` 返回 `str`，因此在发出第一个 token 之前整段回复已经生成完毕；`tokenize` 里的 `sleep` 只是把成品慢慢放出来，并不能让上游提前产出。同一个模型成本下实测（`scripts/probe_real_vs_fake_streaming.py`）：**假流式首字延迟 2.11s vs 真流式 0.30s（7 倍）**，总时长还多花 1.79s——生成时间被付了两遍（一遍真等模型，一遍假等节奏）。占位模型瞬间返回，所以本地看不出来。**W3 接真实模型时必须把流式入口改成 `AsyncIterator[str]`，否则首字延迟原封不动地翻上去。**
-12. **`asyncio.sleep` 在 Windows 上会向上取整到 15.6ms 的整数倍**（实测 20ms → 31.7ms、50ms → 63.0ms）。所以本机 `STREAM_DELAY_MS=20` 的实际节奏约 31ms/token；Linux 事件循环无此问题，属"本地看着坏、线上是好的"。影响范围主要在未来若用它做重试退避 / 心跳周期 / 限流窗口时，每次会多睡最多 15.6ms，累积成偏差。
-13. **必须用 `--no-access-log` 起服务**：uvicorn 内置访问日志也写 stdout 且是纯文本，不关掉的话 stdout 会被两种格式混在一起（实测一半的行无法解析），`check_json_logs.py` 会（正确地）失败。目前靠"文档 + CI 命令"约束，**应用内部无法强制**——如果接入容器编排，记得把该参数写进启动命令。
+12. **`asyncio.sleep` 在 Windows 上会向上取整到约 15.6ms 的整数倍**（`scripts/probe_sleep_granularity.py` 实测并反推：本机粒度 G ≈ 15.4ms，五个测量点全域最大偏差 0.58ms）。所以本机 `STREAM_DELAY_MS=20` 的实际节奏约 31ms/token（`ceil(20/15.6)=2`）——**「配置 20ms」和「实测 31ms」两个数都对**。对照实验：同机 `time.sleep` 精度在 1% 以内，所以这是**事件循环定时器**的问题，不是操作系统做不了精细睡眠。Linux 无此现象，属「本地看着坏、线上是好的」。影响范围不止流式：将来用 `asyncio.sleep` 做重试退避 / 心跳周期 / 限流窗口时，每次都会多睡最多一个刻度（~15.6ms），在短周期场景下累积成可见偏差。
+13. **必须用 `--no-access-log` 起服务**：uvicorn 内置访问日志也写 stdout 且是纯文本，不关掉的话 stdout 会被两种格式混在一起（实测一半的行无法解析），`check_json_logs.py` 会（正确地）失败。**容器路径已强制**——该参数写死在 `Dockerfile` 的 `CMD` 里（同时写上 `--host 0.0.0.0`）。但**裸起 uvicorn 时仍靠文档 + CI 命令约束，应用内部无法强制**：这是 uvicorn 的启动参数，不是应用能控制的配置，除非包一层自己的启动脚本。目前接受这个缺口，因为它只在「不按文档起服务」时才咬人。
 14. **一次未处理异常会产生 3 份 traceback**：中间件 1 份、异常处理器 1 份、uvicorn 兜底 1 份（框架这层关不掉）。前两份信息侧重不同（请求视角 vs 语义视角），故保留；代价是错误日志量约为正常情况的 3 倍。
 15. **`/demo/errors/{kind}` 是调试端点**，用于验证错误契约；生产应把 `DEMO_ROUTES_ENABLED` 设为 false（关闭后这些路径返回 404，表现得像不存在）。
 16. **`request_id` 是 12 位十六进制而非完整 UUID**：够用（碰撞概率可忽略）、且能安全放进 HTTP 头（头是 latin-1 编码，非 ASCII 值会直接抛 `UnicodeEncodeError`——写测试时把中文塞进 header 就会踩到）。同时它只用于**关联日志**，不承载任何业务含义。
