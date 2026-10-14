@@ -81,6 +81,15 @@ jobs:
         # 少了这个参数，覆盖率是"某次跑过的观测值"；有了它，才是"不可回退的约束"。
         run: uv run pytest -q --cov=ai_lab --cov-report=term-missing --cov-fail-under=100
 
+      - name: 睡眠精度探针（不需要起服务）
+        # 这个脚本原先只在本地跑过一次，数字写进了 README 却没有复现手段——等于传闻。
+        # 进 CI 是为了兑现那条自己记下的教训：脚本不进门就没人跑它，坏了也不知道。
+        #
+        # 它只断言跨平台恒成立的那一条不变量（sleep 从不早于请求时长返回）。
+        # 平台量化现象**只报告不断言**——那是 Windows 专有的，在 Linux runner 上
+        # 断言它会让 CI 无故变红。所以这个 step 在两种平台上都能稳定通过。
+        run: uv run python scripts/probe_sleep_granularity.py
+
   # ------------------------------------------------- 端到端（真实协议栈）
   # 这个 job 存在的唯一理由，是 pytest 那一层证不了协议行为：
   #   TestClient 把 ASGI 事件直接喂给应用，跳过了端口绑定、真实请求头、

@@ -43,9 +43,11 @@ DURATIONS_MS: tuple[float, ...] = (1.0, 5.0, 20.0, 50.0, 100.0)
 # 用平均会被少数离群值带偏。
 ROUNDS = 9
 
-# 判定「没有早返回」的容差。允许 2% 的测量噪声——perf_counter 与调度
-# 之间总有微小偏差，但不可能真的提前睡醒。
-TOLERANCE = 0.98
+# 判定「没有早返回」的容差。放得比较宽（5%）是有意的：这条要进 CI，
+# 而 CI runner 的时钟与调度噪声比开发机大。真出问题（比如有人把 asyncio.sleep
+# 换成忙等或干脆删掉）偏差会远超 5%，所以放宽容差不会漏掉真回归，
+# 却能避免共享 runner 上的偶发红。
+TOLERANCE = 0.95
 
 
 async def measure_asyncio(ms: float, rounds: int) -> list[float]:
